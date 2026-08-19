@@ -301,6 +301,13 @@ struct ChunkMetrics: Sendable {
     var stopReasonText: String = "unknown"
     var parseStatus: ParseStatus = .notApplicable
 
+    // Pre-filter accounting: how much text the batch held vs how much was actually
+    // sent to the model. `skipped` means the batch had no citation-shaped text at
+    // all, so no model call was made for it.
+    var originalChars: Int = 0
+    var sentChars: Int = 0
+    var skipped: Bool = false
+
     var totalSeconds: Double { prefillSeconds + decodeSeconds }
 
     /// Share of generated output that was thinking, measured in characters.
@@ -317,10 +324,23 @@ struct ChunkMetrics: Sendable {
         Int((Double(generatedTokens) * thinkingShare).rounded())
     }
 
+    /// Fraction of the batch's text that was actually sent to the model.
+    var sentShare: Double {
+        guard originalChars > 0 else { return 1 }
+        return Double(sentChars) / Double(originalChars)
+    }
+
     var summaryLine: String {
+        if skipped {
+            return "Batch \(label) | SKIPPED (no citation-shaped text in \(originalChars) chars)"
+        }
         var parts: [String] = ["Batch \(label)"]
         parts.append(String(format: "%.2fs (prefill %.2fs / decode %.2fs)",
                             totalSeconds, prefillSeconds, decodeSeconds))
+        if originalChars > 0, sentChars < originalChars {
+            parts.append(String(format: "sent %d/%d chars (%.0f%%)",
+                                sentChars, originalChars, sentShare * 100))
+        }
         parts.append("\(promptTokens) prompt → \(generatedTokens) generated tok")
         if thinkingChars > 0 {
             parts.append(String(format: "thinking ~%d tok (%.0f%% of output)",
@@ -365,6 +385,10 @@ class LLMManager: ObservableObject {
     Scan the ENTIRE document from beginning to end, including footnotes and any quoted passages from lower
     court/tribunal judgments. If a case is only cited inside a footnote or inside a quoted paragraph, still list it.
 
+    If one case is reported in several reporters printed side by side (e.g. "AIR 1962 SC 605 : (1962) 1 SCR 567"),
+    that is ONE case — write it on a single line, not once per reporter. If the same case is cited more than once
+    in the document, list it only once.
+
     If you cannot find any cited cases, say so explicitly and briefly explain what the document is about instead,
     so we can confirm you are reading the actual document content.
 
@@ -390,6 +414,8 @@ class LLMManager: ObservableObject {
     6. Thoroughness: Scan the ENTIRE document from beginning to end, including the last few paragraphs — do not stop early. Citations often appear later in the document (e.g., in a discussion, analysis, or "reasons for judgment" section), not just near the top.
     7. Nested/Quoted Citations: Citations may appear inside a quoted passage — for example, when this judgment quotes verbatim from a lower court's or tribunal's judgment (often in quotation marks or an indented block), and that quoted text itself references other cases. Extract those cited cases too, exactly as they appear, even if they are inside a quotation.
     8. Footnote Citations: Citations are sometimes given in footnotes (marked with superscript numbers like 1, 2, 3 in the body text) rather than inline in the main paragraph. Check footnote text at the bottom of pages for citations as well.
+    9. Parallel Citations — ONE case, not several: the same judgment is usually reported in more than one reporter, and those citations are printed side by side separated by ":" or ";" or "," — for example "K.M. Nanavati v. State of Maharashtra, AIR 1962 SC 605 : (1962) 1 SCR 567 : 1962 SCJ 1". That is a SINGLE case. Emit ONE entry for it, putting the fullest citation in the "citation" field. Never create one entry per reporter.
+    10. No Repeats: if the same case is cited more than once, include it only ONCE in the list. Do not repeat an entry because the case appears in more than one place.
 
     OUTPUT FORMAT — this is mandatory:
     Respond with ONLY a single valid JSON object, and nothing else — no markdown fences (no ```),
@@ -412,6 +438,26 @@ class LLMManager: ObservableObject {
     {"citedCases":[{"caseName":"K.M. Nanavati v. State of Maharashtra","citation":"AIR 1962 SC 605","year":1962,"court":"Supreme Court of India","context":"Cited regarding the scope of judicial review of jury verdicts."},{"caseName":"State of Punjab v. Bhajan Kaur","citation":null,"year":null,"court":null,"context":"Referenced as a precedent for motor accident compensation without further detail given in the text."}]}
 
     If no cases are cited in the document, respond with exactly: {"citedCases":[]}
+    """
+
+    /// Appended to whichever system prompt is active, but ONLY when the regex pre-filter is on.
+    ///
+    /// With the filter on, the model no longer receives continuous pages — it receives the
+    /// passages around each candidate citation, joined with "[…]". Left unexplained, the gaps
+    /// read as a damaged document, and instructions like "scan the entire document from
+    /// beginning to end" become quietly false. Keeping this separate from the base prompts means
+    /// that turning the filter off restores the original prompt byte-for-byte, so the toggle is
+    /// a clean A/B with one variable.
+    let passageExcerptNote = """
+
+
+    INPUT FORMAT NOTE — read this before anything else:
+    The text below is NOT continuous prose. It is a set of excerpts from the document: the
+    passages surrounding each place where a case appears to be cited, joined together, with "[…]"
+    marking text deliberately left out in between. The gaps are intentional and expected. Do not
+    treat them as missing or corrupted information, do not attempt to reconstruct them, and do
+    not mention them in your answer. Extract the cases cited in the excerpts you are given, and
+    judge completeness only against those excerpts.
     """
 
     // Loaded models are cached so we don't re-download/re-load repeatedly
@@ -455,7 +501,7 @@ class LLMManager: ObservableObject {
         return container
     }
 
-    func generateStructuredOutput(pdfText: String, model: LLMModel, outputFormat: OutputFormat, thinkingEnabled: Bool = true) async throws -> String {
+    func generateStructuredOutput(pdfText: String, model: LLMModel, outputFormat: OutputFormat, thinkingEnabled: Bool = true, preFilterEnabled: Bool = true) async throws -> String {
         guard let repoID = model.hubRepoID else {
             throw LLMError.noRepoConfigured
         }
@@ -466,7 +512,8 @@ class LLMManager: ObservableObject {
         defer { isGenerating = false }
 
         let container = try await loadContainer(repoID: repoID, architectureType: model.architectureType)
-        let activePrompt = outputFormat == .json ? jsonSystemPrompt : textOnlySystemPrompt
+        let basePrompt = outputFormat == .json ? jsonSystemPrompt : textOnlySystemPrompt
+        let activePrompt = preFilterEnabled ? basePrompt + passageExcerptNote : basePrompt
 
         // START TOTAL TIMER
         let totalStartTime = CFAbsoluteTimeGetCurrent()
@@ -489,25 +536,51 @@ class LLMManager: ObservableObject {
         var allMetrics: [ChunkMetrics] = []
 
         for (index, batch) in batches.enumerated() {
+            let batchLabel = "\(index + 1)/\(batches.count) \(batch.pageRangeLabel)"
+
             statusText = isSingleBatch
                 ? "Processing document..."
                 : "Processing batch \(index + 1) of \(batches.count) (\(batch.pageRangeLabel))..."
 
+            // Pre-filter: narrow the batch to the passages around citation-shaped text.
+            // A batch with nothing citation-shaped in it is skipped entirely — that is
+            // where most of the saving comes from, since it costs no model call at all.
+            var textToSend = batch.text
+            if preFilterEnabled {
+                guard let passages = CitationScanner.candidatePassages(in: batch.text) else {
+                    var skippedMetrics = ChunkMetrics()
+                    skippedMetrics.label = batchLabel
+                    skippedMetrics.originalChars = batch.text.count
+                    skippedMetrics.skipped = true
+                    allMetrics.append(skippedMetrics)
+                    print("⏭️  [SKIP] \(skippedMetrics.summaryLine)")
+                    continue
+                }
+                textToSend = passages
+            }
+
             // Single-batch documents get no batch label, so their prompt is identical
-            // to what a whole-document run has always sent.
+            // to what a whole-document run has always sent. With the pre-filter on, the batch
+            // is excerpts FROM those pages rather than the pages themselves — saying "a batch
+            // of pages" there would contradict the input-format note.
+            let batchSource = preFilterEnabled
+                ? "excerpts taken from pages \(batch.pageRangeLabel)"
+                : "a batch of pages (\(batch.pageRangeLabel))"
             let label: String? = isSingleBatch
                 ? nil
-                : "This is a batch of pages (\(batch.pageRangeLabel)) from a larger legal document, part \(index + 1) of \(batches.count) overall. Extract cited cases found in THIS BATCH only."
+                : "This is \(batchSource) of a larger legal document, part \(index + 1) of \(batches.count) overall. Extract cited cases found in THIS BATCH only."
 
             print("▶️ [START] Batch \(index + 1)/\(batches.count) (\(batch.pageRangeLabel))...")
 
             let result = try await generateForChunk(
-                container: container, activePrompt: activePrompt, chunkText: batch.text,
+                container: container, activePrompt: activePrompt, chunkText: textToSend,
                 chunkLabel: label, thinkingEnabled: thinkingEnabled
             )
 
             var metrics = result.metrics
-            metrics.label = "\(index + 1)/\(batches.count) \(batch.pageRangeLabel)"
+            metrics.label = batchLabel
+            metrics.originalChars = batch.text.count
+            metrics.sentChars = textToSend.count
 
             // Record whether this batch's JSON actually parsed. A truncated or malformed
             // batch contributes zero cases to the merge and would otherwise vanish silently.
@@ -526,10 +599,17 @@ class LLMManager: ObservableObject {
         }
 
         let finalResult: String
-        if isSingleBatch {
-            finalResult = chunkOutputs[0]
+        if chunkOutputs.isEmpty {
+            // Every batch was filtered out — the document contains no citation-shaped
+            // text anywhere. Return the empty result in the requested shape rather than
+            // an empty string, which the UI would report as "model returned empty output".
+            finalResult = outputFormat == .json
+                ? "{\"citedCases\":[]}"
+                : "No cited cases found in this document."
+        } else if isSingleBatch {
+            finalResult = Self.dedupedIfPossible(chunkOutputs[0], outputFormat: outputFormat)
         } else {
-            statusText = "Merging results from \(batches.count) page-batches..."
+            statusText = "Merging results from \(chunkOutputs.count) page-batches..."
             finalResult = Self.mergeChunkOutputs(chunkOutputs, outputFormat: outputFormat)
         }
 
@@ -570,6 +650,9 @@ class LLMManager: ObservableObject {
         let responseChars = metrics.reduce(0) { $0 + $1.responseChars }
         let estThinkingTokens = metrics.reduce(0) { $0 + $1.estimatedThinkingTokens }
         let truncated = metrics.filter { $0.hitTokenLimit }
+        let skipped = metrics.filter { $0.skipped }
+        let originalChars = metrics.reduce(0) { $0 + $1.originalChars }
+        let sentChars = metrics.reduce(0) { $0 + $1.sentChars }
         let parseFailures = metrics.filter {
             if case .failed = $0.parseStatus { return true }
             return false
@@ -585,10 +668,15 @@ class LLMManager: ObservableObject {
             : "n/a"
         let thinkingPct = pct(Double(thinkingChars), of: Double(thinkingChars + responseChars))
 
+        let filterLine = originalChars > 0
+            ? "\(sentChars)/\(originalChars) chars sent (\(pct(Double(sentChars), of: Double(originalChars)))), \(skipped.count) batch(es) skipped"
+            : "not applied"
+
         print("""
 
         ═══════════ RUN SUMMARY (\(outputFormat.rawValue)) ═══════════
-        Batches:        \(metrics.count)
+        Batches:        \(metrics.count) (\(metrics.count - skipped.count) sent to the model)
+        Pre-filter:     \(filterLine)
         Wall clock:     \(String(format: "%.2fs", totalSeconds))  (in-model: \(String(format: "%.2fs", measured)))
         Prefill:        \(String(format: "%.2fs", prefill))  (\(pct(prefill, of: measured)) of model time)  \(promptTokens) tok
         Decode:         \(String(format: "%.2fs", decode))  (\(pct(decode, of: measured)) of model time)  \(generatedTokens) tok
@@ -641,22 +729,72 @@ class LLMManager: ObservableObject {
             return batches
         }
 
+    /// Letters and digits only, lowercased — so "A.I.R. 1962 SC 605" and "AIR 1962 SC 605",
+    /// or "K.M. Nanavati v. State" and "K M Nanavati v State", collapse to one key.
+    private static func dedupeKey(_ text: String) -> String {
+        text.lowercased().filter { $0.isLetter || $0.isNumber }
+    }
+
+    /// Collapse repeat references to the same case.
+    ///
+    /// Matches on EITHER the case name or the citation, because the two duplicate in different
+    /// ways. A case cited on two different pages repeats the name; a case with PARALLEL
+    /// citations ("AIR 1962 SC 605 : (1962) 1 SCR 567" — one case, two reporters printed side
+    /// by side) can come back as two entries whose names differ slightly but whose citation
+    /// strings overlap. Name-only matching, which is all this used to do, missed the second kind
+    /// — and the passage pre-filter makes it MORE likely by placing parallel citations together
+    /// in a single window.
+    ///
+    /// First occurrence wins: it is normally the one written out in full.
+    private static func dedupeCitedCases(_ cases: [CitedCase]) -> [CitedCase] {
+        var seenNames = Set<String>()
+        var seenCitations = Set<String>()
+        var out: [CitedCase] = []
+
+        for citedCase in cases {
+            let nameKey = dedupeKey(citedCase.caseName)
+            guard !nameKey.isEmpty else { continue }
+            let citationKey = citedCase.citation.map(dedupeKey) ?? ""
+
+            let isDuplicate = seenNames.contains(nameKey)
+                || (!citationKey.isEmpty && seenCitations.contains(citationKey))
+
+            // Record the keys even for a rejected duplicate. A case reported in three
+            // reporters can arrive as three entries; dropping the second one's citation
+            // would let the third through under a slightly different name.
+            seenNames.insert(nameKey)
+            if !citationKey.isEmpty { seenCitations.insert(citationKey) }
+
+            if isDuplicate { continue }
+            out.append(citedCase)
+        }
+        return out
+    }
+
+    /// Re-emit one batch's JSON with duplicates collapsed.
+    ///
+    /// Single-batch documents never reached `mergeChunkOutputs`, so they were the one path with
+    /// no dedupe at all. Falls back to the raw output whenever it doesn't parse, so this can
+    /// only ever remove duplicates — never destroy a result.
+    private static func dedupedIfPossible(_ output: String, outputFormat: OutputFormat) -> String {
+        guard outputFormat == .json,
+              let parsed = DocumentExtractionResult.parse(from: output) else { return output }
+        let result = DocumentExtractionResult(citedCases: dedupeCitedCases(parsed.citedCases))
+        guard let data = try? JSONEncoder().encode(result),
+              let json = String(data: data, encoding: .utf8) else { return output }
+        return json
+    }
+
     /// Merges the per-chunk outputs into one final answer.
     private static func mergeChunkOutputs(_ outputs: [String], outputFormat: OutputFormat) -> String {
         switch outputFormat {
         case .json:
-            var merged: [CitedCase] = []
-            var seenKeys = Set<String>()
+            var all: [CitedCase] = []
             for output in outputs {
                 guard let parsed = DocumentExtractionResult.parse(from: output) else { continue }
-                for citedCase in parsed.citedCases {
-                    let key = citedCase.caseName.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
-                    guard !key.isEmpty, !seenKeys.contains(key) else { continue }
-                    seenKeys.insert(key)
-                    merged.append(citedCase)
-                }
+                all.append(contentsOf: parsed.citedCases)
             }
-            let result = DocumentExtractionResult(citedCases: merged)
+            let result = DocumentExtractionResult(citedCases: dedupeCitedCases(all))
             guard let data = try? JSONEncoder().encode(result),
                   let jsonString = String(data: data, encoding: .utf8) else {
                 return outputs.joined(separator: "\n\n")

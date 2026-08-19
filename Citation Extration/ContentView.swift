@@ -16,6 +16,10 @@ struct ContentView: View {
     @State private var selectedModel: LLMModel = .gemma4
     @State private var selectedOutputFormat: OutputFormat = .text
     @State private var thinkingEnabled: Bool = true
+    // Regex pre-filter: send the model only the passages around citation-shaped text.
+    // Exposed as a toggle so it can be A/B'd against the full-text baseline on the
+    // same document — it trades a recall risk for speed and must be measured, not assumed.
+    @State private var preFilterEnabled: Bool = true
     
     @State private var uploadedPDFText: String? = nil
     @State private var uploadedFileName: String? = nil
@@ -80,6 +84,12 @@ struct ContentView: View {
                     }
                     
                     Spacer()
+
+                    Toggle("Pre-filter", isOn: $preFilterEnabled)
+                        .toggleStyle(.switch)
+                        .disabled(llmManager.isGenerating)
+                        .frame(width: 130)
+                        .help("Send only passages around citation-shaped text instead of whole pages")
 
                     Toggle("Thinking", isOn: $thinkingEnabled)
                         .toggleStyle(.switch)
@@ -293,7 +303,7 @@ struct ContentView: View {
         errorMessage = nil
         Task {
             do {
-                let output = try await llmManager.generateStructuredOutput(pdfText: text, model: selectedModel, outputFormat: newFormat, thinkingEnabled: thinkingEnabled)
+                let output = try await llmManager.generateStructuredOutput(pdfText: text, model: selectedModel, outputFormat: newFormat, thinkingEnabled: thinkingEnabled, preFilterEnabled: preFilterEnabled)
                 if output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     self.errorMessage = "Model returned empty output."
                     return
@@ -334,7 +344,7 @@ struct ContentView: View {
 
         Task {
             do {
-                let output = try await llmManager.generateStructuredOutput(pdfText: text, model: selectedModel, outputFormat: selectedOutputFormat, thinkingEnabled: thinkingEnabled)
+                let output = try await llmManager.generateStructuredOutput(pdfText: text, model: selectedModel, outputFormat: selectedOutputFormat, thinkingEnabled: thinkingEnabled, preFilterEnabled: preFilterEnabled)
 
                 if output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     self.errorMessage = "Model returned empty output."

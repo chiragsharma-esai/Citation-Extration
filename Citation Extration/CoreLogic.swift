@@ -748,27 +748,55 @@ class LLMManager: ObservableObject {
     /// First occurrence wins: it is normally the one written out in full.
     private static func dedupeCitedCases(_ cases: [CitedCase]) -> [CitedCase] {
         var seenNames = Set<String>()
-        var seenCitations = Set<String>()
+        var citationOwners: [String: Set<String>] = [:]   // citation key -> name tokens seen with it
         var out: [CitedCase] = []
 
         for citedCase in cases {
             let nameKey = dedupeKey(citedCase.caseName)
             guard !nameKey.isEmpty else { continue }
             let citationKey = citedCase.citation.map(dedupeKey) ?? ""
+            let nameTokens = Self.nameTokens(citedCase.caseName)
 
-            let isDuplicate = seenNames.contains(nameKey)
-                || (!citationKey.isEmpty && seenCitations.contains(citationKey))
+            var isDuplicate = seenNames.contains(nameKey)
 
-            // Record the keys even for a rejected duplicate. A case reported in three
-            // reporters can arrive as three entries; dropping the second one's citation
-            // would let the third through under a slightly different name.
+            // Collapsing on a shared citation requires the party names to overlap too.
+            //
+            // Without that check this deletes real findings: a judgment may report that the
+            // SAME citation was wrongly attributed to two DIFFERENT cases — "the correct cause
+            // title for 2020 SCC OnLine SC 341 is M. Subramaniam v. S. Janaki", against a
+            // tribunal that cited it as State Bank of India v. Shree Ram. Both belong in the
+            // output; a mis-citation is exactly what this tool exists to surface. Requiring a
+            // shared name token still collapses parallel citations of one case, where the names
+            // are the same or near-identical spellings.
+            if !isDuplicate, !citationKey.isEmpty, let owners = citationOwners[citationKey] {
+                isDuplicate = owners.isEmpty || !owners.isDisjoint(with: nameTokens)
+            }
+
+            // Record keys even for a rejected duplicate: a case reported in three reporters can
+            // arrive as three entries, and dropping the second one's citation would let the
+            // third through under a slightly different name.
             seenNames.insert(nameKey)
-            if !citationKey.isEmpty { seenCitations.insert(citationKey) }
+            if !citationKey.isEmpty {
+                citationOwners[citationKey, default: []].formUnion(nameTokens)
+            }
 
             if isDuplicate { continue }
             out.append(citedCase)
         }
         return out
+    }
+
+    /// Meaningful words of a case name, for deciding whether two entries name the same parties.
+    /// Short tokens and the connectives that appear in every case name carry no signal.
+    private static func nameTokens(_ name: String) -> Set<String> {
+        let noise: Set<String> = ["versus", "state", "union", "india", "ltd", "limited",
+                                  "anr", "another", "ors", "others", "the", "and", "bank",
+                                  "company", "corporation", "pvt", "private"]
+        let words = name.lowercased()
+            .split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+            .map(String.init)
+            .filter { $0.count > 3 && !noise.contains($0) }
+        return Set(words)
     }
 
     /// Re-emit one batch's JSON with duplicates collapsed.

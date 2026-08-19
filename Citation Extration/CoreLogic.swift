@@ -389,6 +389,11 @@ class LLMManager: ObservableObject {
     that is ONE case — write it on a single line, not once per reporter. If the same case is cited more than once
     in the document, list it only once.
 
+    Also list any case named in order to CORRECT, question or dispute another citation — for example
+    "the correct cause title for this citation is X v. Y", or a case called wrongly cited, misattributed or
+    non-existent. Those count as referenced even though nobody relied on them, and say so in the reason. Where two
+    different case names are attached to the SAME citation, list BOTH — that conflict is the point.
+
     If you cannot find any cited cases, say so explicitly and briefly explain what the document is about instead,
     so we can confirm you are reading the actual document content.
 
@@ -416,6 +421,7 @@ class LLMManager: ObservableObject {
     8. Footnote Citations: Citations are sometimes given in footnotes (marked with superscript numbers like 1, 2, 3 in the body text) rather than inline in the main paragraph. Check footnote text at the bottom of pages for citations as well.
     9. Parallel Citations — ONE case, not several: the same judgment is usually reported in more than one reporter, and those citations are printed side by side separated by ":" or ";" or "," — for example "K.M. Nanavati v. State of Maharashtra, AIR 1962 SC 605 : (1962) 1 SCR 567 : 1962 SCJ 1". That is a SINGLE case. Emit ONE entry for it, putting the fullest citation in the "citation" field. Never create one entry per reporter.
     10. No Repeats: if the same case is cited more than once, include it only ONCE in the list. Do not repeat an entry because the case appears in more than one place.
+    11. Corrections and Disputed Citations: also list a case that is named in order to CORRECT, question, or dispute another citation — for example "the correct cause title for this citation is X v. Y", or a case identified as wrongly cited, misattributed, fabricated or non-existent. Such a case is still referenced by the document even though nobody relied on it as a precedent, and identifying it is important. Note the circumstance in the "context" field. Where two different case names are attached to the SAME citation, list BOTH as separate entries — that conflict is the point, not a duplicate.
 
     OUTPUT FORMAT — this is mandatory:
     Respond with ONLY a single valid JSON object, and nothing else — no markdown fences (no ```),

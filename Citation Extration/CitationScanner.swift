@@ -74,7 +74,17 @@ enum CitationScanner {
 
     // MARK: - Pattern
 
-    /// One alternation over both vocabularies, bounded by non-letters, with an optional
+    /// What produced a match. Kept apart because they are not equally strong evidence: a
+    /// reporter token is a citation on its own, while a neutral abbreviation or a bare "v."
+    /// can equally well be the document's OWN caption (see `isCaptionBlock`).
+    private enum MatchKind { case reporter, neutral, party }
+
+    private struct Hit {
+        let range: NSRange
+        let kind: MatchKind
+    }
+
+    /// One alternation over a vocabulary, bounded by non-letters, with an optional
     /// parenthesised court suffix.
     ///
     /// - `(?<![A-Za-z])` / `(?![A-Za-z])` mean "not glued to another word", which is the
@@ -82,7 +92,7 @@ enum CitationScanner {
     ///   citation opening a line, or written "(2008) 1 SCC 1", still matches).
     /// - All-caps tokens also accept interior dots, so "A.I.R." matches alongside "AIR".
     /// - `(\s*\([A-Za-z&.\- ]{1,14}\))?` absorbs the court suffix in "AIR(SC)" / "CTR (Mad)".
-    private static let citationRegex: NSRegularExpression = {
+    private static func tokenRegex(_ tokens: [String]) -> NSRegularExpression {
         func tolerant(_ token: String) -> String {
             let escaped = NSRegularExpression.escapedPattern(for: token)
             // "AIR" -> "A\.?I\.?R\.?" so the dotted spelling matches too. Only for all-caps
@@ -90,32 +100,63 @@ enum CitationScanner {
             guard token.allSatisfy({ $0.isUppercase || $0 == "&" }) else { return escaped }
             return token.map { "\(NSRegularExpression.escapedPattern(for: String($0)))\\.?" }.joined()
         }
-
         // Longest first so "AllMR" wins over a hypothetical shorter prefix.
-        let tokens = (reporterTokens + neutralTokens)
+        let alternation = tokens
             .sorted { ($0.count, $0) > ($1.count, $1) }
             .map(tolerant)
             .joined(separator: "|")
-
-        var pattern = "(?<![A-Za-z])(?:\(tokens))(?:\\s*\\([A-Za-z&.\\- ]{1,14}\\))?(?![A-Za-z])"
-
-        if includePartyMarker {
-            // Minimal party marker — "v." / "vs." / "v/s" / "versus" between two words. Not a
-            // party-name grammar, just a signal that a case is being named here.
-            //
-            // Case-INSENSITIVE and punctuation-tolerant on purpose: judgments write "Vs.", "VS."
-            // and "Vs.," at least as often as "v.". Requiring lowercase and a following "\s\w"
-            // (as this first did) lost roughly a third of the party-only references on a 116
-            // judgment sample. The preceding "\w\s" still prevents a bare initial ("Mr. V.
-            // Ramasamy") from matching, since "." is not a word character.
-            // The bracketed separators also allow the hyphenated "-vs-" form, which is common
-            // in Madras/Kerala formatting ("Masti Health ... -vs- Commissioner").
-            pattern += "|(?<=\\w[\\s\\-])(?i:v|vs|v/s)\\.?(?=[\\s\\-,;:]|$)|(?i:\\bversus\\b)"
-        }
-
         // A malformed pattern here is a programming error, not a runtime condition.
-        return try! NSRegularExpression(pattern: pattern, options: [])
-    }()
+        return try! NSRegularExpression(
+            pattern: "(?<![A-Za-z])(?:\(alternation))(?:\\s*\\([A-Za-z&.\\- ]{1,14}\\))?(?![A-Za-z])")
+    }
+
+    private static let reporterRegex = tokenRegex(reporterTokens)
+    private static let neutralRegex = tokenRegex(neutralTokens)
+
+    /// Minimal party marker — "v." / "vs." / "v/s" / "versus" between two words. Not a
+    /// party-name grammar, just a signal that a case is being named here.
+    ///
+    /// Case-INSENSITIVE and punctuation-tolerant on purpose: judgments write "Vs.", "VS."
+    /// and "Vs.," at least as often as "v.". Requiring lowercase and a following "\s\w"
+    /// (as this first did) lost roughly a third of the party-only references on a 116
+    /// judgment sample. The preceding "\w\s" still prevents a bare initial ("Mr. V.
+    /// Ramasamy") from matching, since "." is not a word character. The bracketed separators
+    /// also allow the hyphenated "-vs-" form common in Madras/Kerala formatting.
+    private static let partyRegex = try! NSRegularExpression(
+        pattern: "(?<=\\w[\\s\\-])(?i:v|vs|v/s)\\.?(?=[\\s\\-,;:]|$)|(?i:\\bversus\\b)")
+
+    /// Every citation-shaped match in `text`, tagged with what produced it.
+    private static func hits(in text: String, range: NSRange) -> [Hit] {
+        var out = reporterRegex.matches(in: text, range: range).map { Hit(range: $0.range, kind: .reporter) }
+        out += neutralRegex.matches(in: text, range: range).map { Hit(range: $0.range, kind: .neutral) }
+        if includePartyMarker {
+            out += partyRegex.matches(in: text, range: range).map { Hit(range: $0.range, kind: .party) }
+        }
+        return out.sorted { $0.range.location < $1.range.location }
+    }
+
+    // MARK: - The document's own caption
+
+    /// Every judgment opens with its own cause title — a neutral citation, the party names,
+    /// and "VERSUS" — which matches this scanner but is the PRIMARY case, the one thing the
+    /// extraction prompt explicitly excludes. Left in, it guarantees one pointless model call
+    /// per document: on a 2026 INSC 668 run that was 22 of 78 seconds spent concluding
+    /// "no cases found" from the cover page.
+    ///
+    /// Both an appellant-side and a respondent-side marker are required, in capitals, because
+    /// together they only ever occur in a cause title. Prose says "the appellant submits";
+    /// it does not say "APPELLANT(S)" and "RESPONDENT(S)" in the same breath. Title-case
+    /// captions simply fail to match and keep their window — the safe direction.
+    private static let appellantMarker = try! NSRegularExpression(
+        pattern: "\\b(?:APPELLANT|PETITIONER|APPLICANT|PLAINTIFF)S?\\(?S?\\)?")
+    private static let respondentMarker = try! NSRegularExpression(
+        pattern: "\\b(?:RESPONDENT|DEFENDANT)S?\\(?S?\\)?")
+
+    private static func isCaptionBlock(_ text: String) -> Bool {
+        let range = NSRange(location: 0, length: (text as NSString).length)
+        return appellantMarker.firstMatch(in: text, range: range) != nil
+            && respondentMarker.firstMatch(in: text, range: range) != nil
+    }
 
     // MARK: - Sentence boundaries
 
@@ -154,8 +195,8 @@ enum CitationScanner {
 
     /// True when the text contains anything citation-shaped. Cheap enough to run per page.
     static func containsCitation(_ text: String) -> Bool {
-        let ns = text as NSString
-        return citationRegex.firstMatch(in: text, range: NSRange(location: 0, length: ns.length)) != nil
+        let range = NSRange(location: 0, length: (text as NSString).length)
+        return !hits(in: text, range: range).isEmpty
     }
 
     /// The passages worth sending to the model: every citation-shaped match plus `window`
@@ -166,7 +207,7 @@ enum CitationScanner {
     static func candidatePassages(in text: String, window: Int = defaultSentenceWindow) -> String? {
         let ns = text as NSString
         let full = NSRange(location: 0, length: ns.length)
-        let matches = citationRegex.matches(in: text, range: full)
+        let matches = hits(in: text, range: full)
         guard !matches.isEmpty else { return nil }
 
         let starts = sentenceStarts(in: ns)
@@ -201,10 +242,21 @@ enum CitationScanner {
             }
         }
 
-        let passages = merged.map {
-            ns.substring(with: NSRange(location: $0.lo, length: $0.hi - $0.lo))
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-        }.filter { !$0.isEmpty }
+        let passages: [String] = merged.compactMap { range in
+            let nsRange = NSRange(location: range.lo, length: range.hi - range.lo)
+            let windowText = ns.substring(with: nsRange)
+
+            // A window carrying a real reporter citation is always kept. One held up only by a
+            // neutral abbreviation or a bare "v." may be the document's own cause title, which
+            // is the primary case and explicitly out of scope for extraction.
+            let hasReporter = matches.contains {
+                $0.kind == .reporter && NSIntersectionRange($0.range, nsRange).length > 0
+            }
+            if !hasReporter, isCaptionBlock(windowText) { return nil }
+
+            let trimmed = windowText.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
 
         return passages.isEmpty ? nil : passages.joined(separator: "\n\n[…]\n\n")
     }

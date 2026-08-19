@@ -18,7 +18,6 @@
 
 /* Begin PBXFileReference section */
 		DE57F80630265AA800ADE2BB /* Citation Extration.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Citation Extration.app"; sourceTree = BUILT_PRODUCTS_DIR; };
-		DE57F81530265C8100ADE2BB /* Untitled.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Untitled.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -50,7 +49,6 @@
 		DE57F7FD30265AA800ADE2BB = {
 			isa = PBXGroup;
 			children = (
-				DE57F81530265C8100ADE2BB /* Untitled.swift */,
 				DE57F80830265AA800ADE2BB /* Citation Extration */,
 				DE57F81C3026630300ADE2BB /* Frameworks */,
 				DE57F80730265AA800ADE2BB /* Products */,

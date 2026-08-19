@@ -267,6 +267,85 @@ enum OutputFormat: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+// MARK: - Instrumentation
+// These live at file scope rather than nested inside LLMManager on purpose: the class is
+// @MainActor, and these values are constructed inside the non-isolated `@Sendable` closure
+// passed to `ModelContainer.perform`. Nesting them would inherit MainActor isolation and
+// make them unusable there — the same reason `gemmaChannelReasoningConfig` is `nonisolated`.
+
+/// Whether a batch's output could be parsed back into structured cases.
+enum ParseStatus: Sendable {
+    case notApplicable      // Text mode — there is no JSON to parse
+    case failed             // JSON mode, but parsing failed (malformed or truncated)
+    case parsed(count: Int)
+}
+
+/// Per-batch timing and token telemetry.
+///
+/// This exists to answer two questions we were previously guessing at: how much of the
+/// wall clock is prefill vs decode (which decides whether prefix caching or faster decode
+/// is the optimisation worth doing), and whether any batch was silently truncated by the
+/// token limit — which drops citations without surfacing any error to the user.
+///
+/// All of it comes free from `GenerateCompletionInfo` on the generation stream; none of it
+/// costs an extra model or tokenizer pass.
+struct ChunkMetrics: Sendable {
+    var label: String = ""
+    var promptTokens: Int = 0
+    var generatedTokens: Int = 0
+    var prefillSeconds: Double = 0
+    var decodeSeconds: Double = 0
+    var thinkingChars: Int = 0
+    var responseChars: Int = 0
+    var hitTokenLimit: Bool = false
+    var stopReasonText: String = "unknown"
+    var parseStatus: ParseStatus = .notApplicable
+
+    var totalSeconds: Double { prefillSeconds + decodeSeconds }
+
+    /// Share of generated output that was thinking, measured in characters.
+    /// Characters are a proxy: the stream reports an exact token count for the whole
+    /// generation, but does not tell us which of those tokens were reasoning.
+    var thinkingShare: Double {
+        let total = thinkingChars + responseChars
+        guard total > 0 else { return 0 }
+        return Double(thinkingChars) / Double(total)
+    }
+
+    /// The exact generated-token count, apportioned by the thinking/response character split.
+    var estimatedThinkingTokens: Int {
+        Int((Double(generatedTokens) * thinkingShare).rounded())
+    }
+
+    var summaryLine: String {
+        var parts: [String] = ["Batch \(label)"]
+        parts.append(String(format: "%.2fs (prefill %.2fs / decode %.2fs)",
+                            totalSeconds, prefillSeconds, decodeSeconds))
+        parts.append("\(promptTokens) prompt → \(generatedTokens) generated tok")
+        if thinkingChars > 0 {
+            parts.append(String(format: "thinking ~%d tok (%.0f%% of output)",
+                                estimatedThinkingTokens, thinkingShare * 100))
+        }
+        switch parseStatus {
+        case .parsed(let count): parts.append("\(count) cases")
+        case .failed: parts.append("⚠️ JSON PARSE FAILED")
+        case .notApplicable: break
+        }
+        if hitTokenLimit {
+            parts.append("⚠️ TRUNCATED (hit maxTokens)")
+        } else if stopReasonText == "cancelled" {
+            parts.append("⚠️ cancelled")
+        }
+        return parts.joined(separator: " | ")
+    }
+}
+
+/// Generated text plus the telemetry for the call that produced it.
+struct ChunkResult: Sendable {
+    let text: String
+    let metrics: ChunkMetrics
+}
+
 // MARK: - LLM Manager
 @MainActor
 class LLMManager: ObservableObject {
@@ -393,106 +472,79 @@ class LLMManager: ObservableObject {
         let totalStartTime = CFAbsoluteTimeGetCurrent()
 
         // =================================================================================================
-        // BATCH PROCESSING (ACTIVE)
-        // Divides the document into batches (pages) and processes them in parallel.
+        // BATCH PROCESSING (SERIAL — deliberately)
+        //
+        // Batches run one at a time. This is not a missed optimisation: `ModelContainer.perform`
+        // takes an exclusive async lock (SerialAccessContainer -> AsyncMutex) held for the whole
+        // duration of the call, so concurrent batches queue behind each other regardless. The
+        // TaskGroup that used to live here produced zero parallelism and logs that claimed
+        // otherwise. Real concurrency would require batched generation (one forward pass over N
+        // sequences), which the high-level MLX API does not expose.
         // =================================================================================================
-        
+
         let batches = Self.chunkByPages(pdfText)
-// =================================================================================================
-        // 2. FULL PARSE LOGIC (Single Document Processing)
-        // Answer: YES, the logic is separate.
-        // If the document is small enough to fit in exactly 1 batch (e.g., 5 pages or less),
-        // it skips the parallel processing entirely and runs this simple block.
-        // =================================================================================================
-        if batches.count == 1 {
+        let isSingleBatch = batches.count == 1
+
+        var chunkOutputs: [String] = []
+        var allMetrics: [ChunkMetrics] = []
+
+        for (index, batch) in batches.enumerated() {
+            statusText = isSingleBatch
+                ? "Processing document..."
+                : "Processing batch \(index + 1) of \(batches.count) (\(batch.pageRangeLabel))..."
+
+            // Single-batch documents get no batch label, so their prompt is identical
+            // to what a whole-document run has always sent.
+            let label: String? = isSingleBatch
+                ? nil
+                : "This is a batch of pages (\(batch.pageRangeLabel)) from a larger legal document, part \(index + 1) of \(batches.count) overall. Extract cited cases found in THIS BATCH only."
+
+            print("▶️ [START] Batch \(index + 1)/\(batches.count) (\(batch.pageRangeLabel))...")
+
             let result = try await generateForChunk(
-                container: container, activePrompt: activePrompt, chunkText: batches[0].text,
-                chunkLabel: nil, thinkingEnabled: thinkingEnabled
+                container: container, activePrompt: activePrompt, chunkText: batch.text,
+                chunkLabel: label, thinkingEnabled: thinkingEnabled
             )
-            
-            let totalEndTime = CFAbsoluteTimeGetCurrent()
-            let formattedTime = String(format: "%.2f", totalEndTime - totalStartTime)
-            print("[TOTAL TIME LOG] Single batch processed in \(formattedTime) seconds.")
-            
-            self.generationTimeText = "Time taken: \(formattedTime) seconds"
-            self.statusText = "Done!"
-            
-            return result
-        }
-        // =================================================================================================
-       // 2. BATCH PROCESSING LOGIC (For Large Documents)
-      // If the document has more than 1 batch (e.g., 6+ pages), it comes here.
-    // =================================================================================================
-        statusText = "Processing \(batches.count) batches (2 at a time)..."
-        var chunkOutputs: [String?] = Array(repeating: nil, count: batches.count)
-// =================================================================================================
-      // 3. PARALLEL PROCESSING LOGIC
-     // Answer: YES, parallel processing is handled here.
-    // `maxConcurrentTasks` controls how many batches run at the exact same time on the GPU.
-    // `withThrowingTaskGroup` is Swift's native way to run multiple async tasks in parallel.
-   // =================================================================================================
-        let maxConcurrentTasks = 2
 
-        try await withThrowingTaskGroup(of: (Int, String).self) { group in
-            for (index, batch) in batches.enumerated() {
-                if index >= maxConcurrentTasks {
-                    if let result = try await group.next() {
-                        chunkOutputs[result.0] = result.1
-                    }
-                }
-                
-                group.addTask {
-                    // 🟢 LOG: Batch Start
-                    let parallelText = (index == 0) ? "" : "Parallel "
-                    print("▶️ [START] \(parallelText)Processing Batch \(index + 1)/\(batches.count) (\(batch.pageRangeLabel))...")
-                    
-                    let label = "This is a batch of pages (\(batch.pageRangeLabel)) from a larger legal document, part \(index + 1) of \(batches.count) overall. Extract cited cases found in THIS BATCH only."
-                    
-                    let chunkOutput = try await self.generateForChunk(
-                        container: container, activePrompt: activePrompt, chunkText: batch.text,
-                        chunkLabel: label, thinkingEnabled: thinkingEnabled
-                    )
-                    
-                    // 🟢 LOG: Count Cases Found in this Batch
-                    var casesFoundText = ""
-                    if outputFormat == .json {
-                        if let parsed = DocumentExtractionResult.parse(from: chunkOutput) {
-                            casesFoundText = "\(parsed.citedCases.count) cases found"
-                        } else {
-                            casesFoundText = "0 cases found (or JSON parse failed)"
-                        }
-                    } else {
-                        // If Text format, approximate by counting non-empty lines
-                        let lines = chunkOutput.components(separatedBy: .newlines).filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
-                        casesFoundText = "Text generated (\(lines.count) lines)"
-                    }
-                    
-                    // 🟢 LOG: Batch Complete
-                    print("✅ [COMPLETE] Batch \(index + 1)/\(batches.count) finished! -> \(casesFoundText)")
-                    
-                    return (index, chunkOutput)
+            var metrics = result.metrics
+            metrics.label = "\(index + 1)/\(batches.count) \(batch.pageRangeLabel)"
+
+            // Record whether this batch's JSON actually parsed. A truncated or malformed
+            // batch contributes zero cases to the merge and would otherwise vanish silently.
+            if outputFormat == .json {
+                if let parsed = DocumentExtractionResult.parse(from: result.text) {
+                    metrics.parseStatus = .parsed(count: parsed.citedCases.count)
+                } else {
+                    metrics.parseStatus = .failed
                 }
             }
-            
-            for try await result in group {
-                chunkOutputs[result.0] = result.1
-            }
+
+            chunkOutputs.append(result.text)
+            allMetrics.append(metrics)
+
+            print("✅ [COMPLETE] \(metrics.summaryLine)")
         }
 
-        statusText = "Merging results from \(batches.count) page-batches..."
-        let finalOutputs = chunkOutputs.compactMap { $0 }
-        let finalResult = Self.mergeChunkOutputs(finalOutputs, outputFormat: outputFormat)
-        
-        // END TOTAL TIMER
-        let totalEndTime = CFAbsoluteTimeGetCurrent()
-        let totalTimeTaken = totalEndTime - totalStartTime
+        let finalResult: String
+        if isSingleBatch {
+            finalResult = chunkOutputs[0]
+        } else {
+            statusText = "Merging results from \(batches.count) page-batches..."
+            finalResult = Self.mergeChunkOutputs(chunkOutputs, outputFormat: outputFormat)
+        }
+
+        let totalTimeTaken = CFAbsoluteTimeGetCurrent() - totalStartTime
+        Self.printRunSummary(allMetrics, totalSeconds: totalTimeTaken, outputFormat: outputFormat)
+
         let formattedTime = String(format: "%.2f", totalTimeTaken)
-        
-        // Print to console
-        print(" [TOTAL TIME LOG] All \(batches.count) batches processed in \(formattedTime) seconds.")
-        
-        // Update UI variable
-        self.generationTimeText = "Time taken: \(formattedTime) seconds"
+        let totalDecodeSeconds = allMetrics.reduce(0.0) { $0 + $1.decodeSeconds }
+        let totalGeneratedTokens = allMetrics.reduce(0) { $0 + $1.generatedTokens }
+        if totalDecodeSeconds > 0 {
+            let rate = Double(totalGeneratedTokens) / totalDecodeSeconds
+            self.generationTimeText = String(format: "Time taken: %@ seconds (%.1f tok/s)", formattedTime, rate)
+        } else {
+            self.generationTimeText = "Time taken: \(formattedTime) seconds"
+        }
         self.statusText = "Done!"
 
         return finalResult
@@ -504,12 +556,60 @@ class LLMManager: ObservableObject {
         let pageRangeLabel: String  // e.g. "pages 6–10"
     }
 
-    /// Splits the document into batches of `pagesPerBatch` consecutive pages.
-    /// NOTE: If a batch of 5 pages exceeds `maxBatchChars` (e.g., 8000 characters),
-    /// it will be split further into smaller character-based chunks to prevent token overflow.
-   
+    /// Prints the aggregate picture for a run: where the time went, how much of it was
+    /// thinking, and whether anything was truncated or failed to parse.
+    private static func printRunSummary(_ metrics: [ChunkMetrics], totalSeconds: Double, outputFormat: OutputFormat) {
+        guard !metrics.isEmpty else { return }
+
+        let prefill = metrics.reduce(0.0) { $0 + $1.prefillSeconds }
+        let decode = metrics.reduce(0.0) { $0 + $1.decodeSeconds }
+        let measured = prefill + decode
+        let promptTokens = metrics.reduce(0) { $0 + $1.promptTokens }
+        let generatedTokens = metrics.reduce(0) { $0 + $1.generatedTokens }
+        let thinkingChars = metrics.reduce(0) { $0 + $1.thinkingChars }
+        let responseChars = metrics.reduce(0) { $0 + $1.responseChars }
+        let estThinkingTokens = metrics.reduce(0) { $0 + $1.estimatedThinkingTokens }
+        let truncated = metrics.filter { $0.hitTokenLimit }
+        let parseFailures = metrics.filter {
+            if case .failed = $0.parseStatus { return true }
+            return false
+        }
+
+        func pct(_ part: Double, of whole: Double) -> String {
+            guard whole > 0 else { return "n/a" }
+            return String(format: "%.0f%%", part / whole * 100)
+        }
+
+        let decodeRate = decode > 0
+            ? String(format: "%.1f tok/s", Double(generatedTokens) / decode)
+            : "n/a"
+        let thinkingPct = pct(Double(thinkingChars), of: Double(thinkingChars + responseChars))
+
+        print("""
+
+        ═══════════ RUN SUMMARY (\(outputFormat.rawValue)) ═══════════
+        Batches:        \(metrics.count)
+        Wall clock:     \(String(format: "%.2fs", totalSeconds))  (in-model: \(String(format: "%.2fs", measured)))
+        Prefill:        \(String(format: "%.2fs", prefill))  (\(pct(prefill, of: measured)) of model time)  \(promptTokens) tok
+        Decode:         \(String(format: "%.2fs", decode))  (\(pct(decode, of: measured)) of model time)  \(generatedTokens) tok
+        Decode rate:    \(decodeRate)
+        Thinking:       ~\(estThinkingTokens) of \(generatedTokens) generated tok (\(thinkingPct) of output, by chars)
+        Truncated:      \(truncated.isEmpty ? "none" : "⚠️ \(truncated.count) batch(es)")
+        Parse failures: \(parseFailures.isEmpty ? "none" : "⚠️ \(parseFailures.count) batch(es)")
+        ══════════════════════════════════════════════
+        """)
+
+        for m in truncated {
+            print("⚠️  TRUNCATED: batch \(m.label) was cut off by maxTokens after \(m.generatedTokens) generated tokens (~\(m.estimatedThinkingTokens) of them thinking) — citations near the end of this batch were probably lost.")
+        }
+        for m in parseFailures {
+            print("⚠️  PARSE FAILED: batch \(m.label) contributed 0 cases to the merged result.")
+        }
+    }
+
     /// Splits the document strictly into batches of `pagesPerBatch` consecutive pages.
-        /// No character limit is applied. 5 pages will always be exactly 1 batch.
+    /// No character limit is applied — 5 pages is always exactly 1 batch, however long
+    /// those pages are. Watch the run summary for truncation warnings if pages are dense.
         private static func chunkByPages(_ text: String, pagesPerBatch: Int = 5) -> [PageBatch] {
             let pages = text.components(separatedBy: PDFParser.pageBreakMarker)
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -540,21 +640,6 @@ class LLMManager: ObservableObject {
             
             return batches
         }
-
-    /// Splits text into overlapping chunks by character count.
-    private static func chunkText(_ text: String, chunkSize: Int = 6000, overlap: Int = 400) -> [String] {
-        guard text.count > chunkSize else { return [text] }
-
-        var chunks: [String] = []
-        var startIndex = text.startIndex
-        while startIndex < text.endIndex {
-            let endIndex = text.index(startIndex, offsetBy: chunkSize, limitedBy: text.endIndex) ?? text.endIndex
-            chunks.append(String(text[startIndex..<endIndex]))
-            if endIndex == text.endIndex { break }
-            startIndex = text.index(endIndex, offsetBy: -overlap, limitedBy: text.startIndex) ?? text.startIndex
-        }
-        return chunks
-    }
 
     /// Merges the per-chunk outputs into one final answer.
     private static func mergeChunkOutputs(_ outputs: [String], outputFormat: OutputFormat) -> String {
@@ -589,15 +674,13 @@ class LLMManager: ObservableObject {
     private func generateForChunk(
             container: ModelContainer, activePrompt: String, chunkText: String,
             chunkLabel: String?, thinkingEnabled: Bool
-        ) async throws -> String {
-            
-            let startTime = CFAbsoluteTimeGetCurrent()
+        ) async throws -> ChunkResult {
 
             let userContent = chunkLabel != nil
                 ? "Extract the file\n\n\(chunkLabel!)\n\n\(chunkText)"
                 : "Extract the file\n\n\(chunkText)"
 
-            let output = try await container.perform { context in
+            return try await container.perform { context in
                 let chatMessages: [Chat.Message] = [
                     Chat.Message(role: .system, content: activePrompt),
                     Chat.Message(role: .user, content: userContent)
@@ -609,14 +692,6 @@ class LLMManager: ObservableObject {
                         additionalContext: ["enable_thinking": thinkingEnabled]
                     )
                 )
-
-                let rawText = activePrompt + "\n" + userContent
-                let tokenCount = context.tokenizer.encode(text: rawText, addSpecialTokens: false).count
-                print(" [TOKEN LOG] Chunk: \(chunkLabel ?? "Full Doc") | Approx Tokens: \(tokenCount)")
-
-                if tokenCount > 8000 {
-                    print("[WARNING] Token count is very high (\(tokenCount)). Model might slow down or hallucinate.")
-                }
 
                 var generateParameters = GenerateParameters(temperature: 0.0)
                 generateParameters.maxTokens = 4096
@@ -640,6 +715,7 @@ class LLMManager: ObservableObject {
 
                 var fullText = ""
                 var thinkingText = ""
+                var metrics = ChunkMetrics()
 
                 func route(_ segments: [ReasoningEventEmitter.Segment]) {
                     for segment in segments {
@@ -651,31 +727,50 @@ class LLMManager: ObservableObject {
                 }
 
                 for await generation in stream {
-                    if case .chunk(let text) = generation {
+                    switch generation {
+                    case .chunk(let text):
                         if emitter != nil {
                             route(emitter!.process(text))
                         } else {
                             fullText += text
                         }
+
+                    case .info(let info):
+                        // Exact prefill/decode split and stop reason, straight from the
+                        // generator — no extra tokenizer pass needed to measure this.
+                        metrics.promptTokens = info.promptTokenCount
+                        metrics.generatedTokens = info.generationTokenCount
+                        metrics.prefillSeconds = info.promptTime
+                        metrics.decodeSeconds = info.generateTime
+                        switch info.stopReason {
+                        case .stop:
+                            metrics.stopReasonText = "stop"
+                        case .length:
+                            // Generation was cut off by maxTokens rather than finishing.
+                            // With thinking on, reasoning tokens share this budget.
+                            metrics.stopReasonText = "length"
+                            metrics.hitTokenLimit = true
+                        case .cancelled:
+                            metrics.stopReasonText = "cancelled"
+                        }
+
+                    case .toolCall:
+                        break
                     }
                 }
                 if emitter != nil {
                     route(emitter!.finalize())
                 }
 
+                metrics.thinkingChars = thinkingText.count
+                metrics.responseChars = fullText.count
+
                 if !thinkingText.isEmpty {
                     print(" Thinking (\(thinkingText.count) chars, hidden from UI):\n\(thinkingText)")
                 }
 
-                return fullText
+                return ChunkResult(text: fullText, metrics: metrics)
             }
-
-            let endTime = CFAbsoluteTimeGetCurrent()
-            let timeTaken = endTime - startTime
-            let formattedTime = String(format: "%.2f", timeTaken)
-            print(" [TIME LOG] Chunk: \(chunkLabel ?? "Full Doc") finished in \(formattedTime) seconds.")
-
-            return output
         }
 
     private nonisolated static let gemmaChannelReasoningConfig = ReasoningConfig(

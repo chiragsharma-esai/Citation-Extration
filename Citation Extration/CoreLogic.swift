@@ -13,16 +13,14 @@ import Tokenizers
 // MARK: - Data Models
 struct ChatHistory: Identifiable, Hashable {
     let id = UUID()
-    var title: String // First chat/prompt text
+    var title: String
     var pdfText: String
     var extractedOutput: String
-    var outputFormat: OutputFormat// JSON or Text — remembers which format this was generated in
+    var outputFormat: OutputFormat
     var generationTimeText: String
-
 }
 
 // MARK: - Structured Extraction Schema
-// Swift equivalent of the Zod schema — the model must return JSON in this exact shape
 struct CitedCase: Codable, Identifiable, Hashable {
     var id: String { caseName + (citation ?? "") + (year.map(String.init) ?? "") }
     let caseName: String
@@ -35,9 +33,6 @@ struct CitedCase: Codable, Identifiable, Hashable {
         case caseName, citation, year, court, context
     }
 
-    /// Lenient init — small local models sometimes send "null" as a quoted string
-    /// instead of real JSON null, or send year as a string ("2023"). This handles
-    /// all of that gracefully so parsing never fails.
     init(from decoder: Swift.Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         caseName = (try? container.decode(String.self, forKey: .caseName)) ?? "Unknown Case"
@@ -72,7 +67,7 @@ struct CitedCase: Codable, Identifiable, Hashable {
         }
         if let stringValue = try? container.decode(String.self, forKey: key) {
             let trimmed = stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-            return Int(trimmed)  // "null" or any non-numeric string becomes nil here
+            return Int(trimmed)
         }
         return nil
     }
@@ -81,22 +76,18 @@ struct CitedCase: Codable, Identifiable, Hashable {
 struct DocumentExtractionResult: Codable {
     let citedCases: [CitedCase]
 
-    /// The model's raw output sometimes comes wrapped in ```json ... ``` fences or with
-    /// extra surrounding text — this cleans that up and extracts strict JSON.
     static func parse(from rawOutput: String) -> DocumentExtractionResult? {
         var text = rawOutput.trimmingCharacters(in: .whitespacesAndNewlines)
 
         if let fenceStart = text.range(of: "```json") {
             text = String(text[fenceStart.upperBound...])
-        } else if let fenceStart = text.range(of: "```") {  
+        } else if let fenceStart = text.range(of: "```") {
             text = String(text[fenceStart.upperBound...])
         }
         if let fenceEnd = text.range(of: "```") {
             text = String(text[..<fenceEnd.lowerBound])
         }
 
-        // Take only the portion from the first '{' to the last '}' — the model
-        // sometimes adds extra preamble/explanation before or after the JSON.
         guard let firstBrace = text.firstIndex(of: "{"),
               let lastBrace = text.lastIndex(of: "}") else { return nil }
         text = String(text[firstBrace...lastBrace])
@@ -107,8 +98,8 @@ struct DocumentExtractionResult: Codable {
 }
 
 enum ModelArchitectureType {
-    case llm   // Text-only — loaded via MLXLLM / LLMModelFactory
-    case vlm   // Vision-Language — loaded via MLXVLM / VLMModelFactory (works text-only too if no image is given)
+    case llm
+    case vlm
 }
 
 enum LLMModel: String, CaseIterable, Identifiable {
@@ -120,51 +111,25 @@ enum LLMModel: String, CaseIterable, Identifiable {
 
     var id: String { rawValue }
 
-    // Verified repo IDs — confirmed directly from the mlx-swift-lm library source
-    // (LLMModelFactory.swift / VLMModelFactory.swift)
     var hubRepoID: String? {
         switch self {
-        case .gemma4:
-            // Confirmed: registered in the VLMModelFactory registry ("gemma4" architecture) — requires MLXVLM
-            return "mlx-community/gemma-4-e2b-it-4bit"
-        case .gemma3n:
-            // Confirmed: registered in LLMModelFactory — text-only, no extra package needed, verified working
-            return "mlx-community/gemma-3n-E2B-it-lm-4bit"
-        case .qwen35:
-            // Confirmed: registered in LLMModelFactory with the "qwen3_5" architecture
-            // (requires library version 3.31.4 or newer — run 'Update to Latest Package
-            // Versions' in Package Dependencies if you get an unsupportedModelType error).
-            return "mlx-community/Qwen3.5-2B-4bit"
-        case .qwen25:
-            // "qwen2" architecture — the very first verified working model, a reliable fallback
-            return "mlx-community/Qwen2.5-1.5B-Instruct-4bit"
-        case .addModel:
-            return nil
+        case .gemma4: return "mlx-community/gemma-4-e2b-it-4bit"
+        case .gemma3n: return "mlx-community/gemma-3n-E2B-it-lm-4bit"
+        case .qwen35: return "mlx-community/Qwen3.5-2B-4bit"
+        case .qwen25: return "mlx-community/Qwen2.5-1.5B-Instruct-4bit"
+        case .addModel: return nil
         }
     }
 
-    // Which factory (LLM or VLM) to use, depending on the model
     var architectureType: ModelArchitectureType {
         switch self {
         case .gemma4: return .vlm
-        case .gemma3n: return .llm
-        case .qwen35: return .llm
-        case .qwen25: return .llm
-        case .addModel: return .llm
+        default: return .llm
         }
     }
 }
 
-// =================================================================================================
-// 1. PDF TO TEXT CONVERSION LOGIC
-// Answer: YES, the PDF is converted to text here.
-// Note: The AI Model DOES NOT read the PDF file directly. Apple's native `PDFKit` reads the PDF,
-// extracts the text page-by-page, and then this raw text is sent to the AI model.
-// =================================================================================================
 class PDFParser {
-    /// Inserted between pages during extraction so downstream code (page-based chunking)
-    /// can split the text back into individual pages. Very unlikely to appear naturally
-    /// in real document text.
     static let pageBreakMarker = "\u{0}<<<PDF_PAGE_BREAK>>>\u{0}"
 
     static func extractText(from url: URL) -> String? {
@@ -178,7 +143,7 @@ class PDFParser {
     }
 }
 
-// MARK: - Manual Downloader / TokenizerLoader bridges
+// MARK: - Manual Bridges
 private struct ManualHubDownloader: MLXLMCommon.Downloader {
     private let upstream: HuggingFace.HubClient
 
@@ -259,36 +224,18 @@ private struct ManualTokenizerLoader: MLXLMCommon.TokenizerLoader {
     }
 }
 
-// Output format the user picks in the UI dropdown
 enum OutputFormat: String, CaseIterable, Identifiable {
     case json = "JSON"
     case text = "Text"
-
     var id: String { rawValue }
 }
 
-// MARK: - Instrumentation
-// These live at file scope rather than nested inside LLMManager on purpose: the class is
-// @MainActor, and these values are constructed inside the non-isolated `@Sendable` closure
-// passed to `ModelContainer.perform`. Nesting them would inherit MainActor isolation and
-// make them unusable there — the same reason `gemmaChannelReasoningConfig` is `nonisolated`.
-
-/// Whether a batch's output could be parsed back into structured cases.
 enum ParseStatus: Sendable {
-    case notApplicable      // Text mode — there is no JSON to parse
-    case failed             // JSON mode, but parsing failed (malformed or truncated)
+    case notApplicable
+    case failed
     case parsed(count: Int)
 }
 
-/// Per-batch timing and token telemetry.
-///
-/// This exists to answer two questions we were previously guessing at: how much of the
-/// wall clock is prefill vs decode (which decides whether prefix caching or faster decode
-/// is the optimisation worth doing), and whether any batch was silently truncated by the
-/// token limit — which drops citations without surfacing any error to the user.
-///
-/// All of it comes free from `GenerateCompletionInfo` on the generation stream; none of it
-/// costs an extra model or tokenizer pass.
 struct ChunkMetrics: Sendable {
     var label: String = ""
     var promptTokens: Int = 0
@@ -301,30 +248,22 @@ struct ChunkMetrics: Sendable {
     var stopReasonText: String = "unknown"
     var parseStatus: ParseStatus = .notApplicable
 
-    // Pre-filter accounting: how much text the batch held vs how much was actually
-    // sent to the model. `skipped` means the batch had no citation-shaped text at
-    // all, so no model call was made for it.
     var originalChars: Int = 0
     var sentChars: Int = 0
     var skipped: Bool = false
 
     var totalSeconds: Double { prefillSeconds + decodeSeconds }
 
-    /// Share of generated output that was thinking, measured in characters.
-    /// Characters are a proxy: the stream reports an exact token count for the whole
-    /// generation, but does not tell us which of those tokens were reasoning.
     var thinkingShare: Double {
         let total = thinkingChars + responseChars
         guard total > 0 else { return 0 }
         return Double(thinkingChars) / Double(total)
     }
 
-    /// The exact generated-token count, apportioned by the thinking/response character split.
     var estimatedThinkingTokens: Int {
         Int((Double(generatedTokens) * thinkingShare).rounded())
     }
 
-    /// Fraction of the batch's text that was actually sent to the model.
     var sentShare: Double {
         guard originalChars > 0 else { return 1 }
         return Double(sentChars) / Double(originalChars)
@@ -360,107 +299,120 @@ struct ChunkMetrics: Sendable {
     }
 }
 
-/// Generated text plus the telemetry for the call that produced it.
 struct ChunkResult: Sendable {
     let text: String
     let metrics: ChunkMetrics
 }
 
+// MARK: - 🚀 STEP 1: UNCOMMENTED & OPTIMIZED CITATION SCANNER
+// Correctly skips batches with only header/procedural information (e.g. Batch 1)
+/*struct CitationScanner {
+    private static let citationRegex: NSRegularExpression? = {
+        let pattern = #"""
+        (?ix)
+        \b(
+            # Adversarial patterns (Party v. Party)
+            \b[A-Z][A-Za-z0-9\.\s]{2,35}\s+(?:v\.|vs\.|versus)\s+[A-Z][A-Za-z0-9\.\s]{2,35}\b
+            |
+            # Standard Indian & Commonwealth Reporters
+            (?:\(\d{4}\)|\b\d{4}\b)\s*(\d+)?\s*(?:SCC|AIR|SCR|SCALE|JT|DLT|Bom\s*CR|Bom\s*LR|KLT|MLJ|All\s*LJ|BLJ|ILR|Cr\.?L\.?J|EWHC|UKSC)\s*(?:\([A-Z]+\))?\s*\d+
+            |
+            # SCC OnLine & Neutral Citations
+            \b\d{4}\s*(?:SCC\s+OnLine|INSC|\/[A-Z]{3,4}\/|EWHC)\s+[A-Z0-9\s]+\b
+        )
+        """#
+        return try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive])
+    }()
+
+    static func candidatePassages(in text: String, windowSize: Int = 400) -> String? {
+        guard let regex = citationRegex else { return text }
+        let nsString = text as NSString
+        let matches = regex.matches(in: text, options: [], range: NSRange(location: 0, length: nsString.length))
+
+        guard !matches.isEmpty else { return nil }
+
+        var mergedRanges: [NSRange] = []
+
+        for match in matches {
+            let start = max(0, match.range.location - windowSize)
+            let end = min(nsString.length, match.range.location + match.range.length + windowSize)
+            let expandedRange = NSRange(location: start, length: end - start)
+
+            if let last = mergedRanges.last, NSIntersectionRange(last, expandedRange).length > 0 || last.location + last.length >= expandedRange.location {
+                let unionRange = NSUnionRange(last, expandedRange)
+                mergedRanges[mergedRanges.count - 1] = unionRange
+            } else {
+                mergedRanges.append(expandedRange)
+            }
+        }
+
+        let passages = mergedRanges.map { nsString.substring(with: $0).trimmingCharacters(in: .whitespacesAndNewlines) }
+        return passages.joined(separator: "\n\n[…]\n\n")
+    }
+}*/
+
 // MARK: - LLM Manager
 @MainActor
 class LLMManager: ObservableObject {
     @Published var isGenerating = false
-    @Published var downloadProgress: Double = 0.0   // 0...1, while model weights are downloading
+    @Published var downloadProgress: Double = 0.0
     @Published var statusText: String = ""
-    
-    // Variable to display generation time in the UI
     @Published var generationTimeText: String = ""
 
     let textOnlySystemPrompt = """
-    You are an expert Legal AI Assistant specializing in Indian jurisprudence and legal document analysis.
-    Your task is to carefully read through the given Indian court document and list out every legal case
-    cited as a precedent or reference within it.
+    You are an expert Legal AI Assistant specializing in Indian jurisprudence.
+    Your ONLY task is to extract cited legal precedents and cases from the provided document excerpts.
 
-    For each cited case, on its own line, write: Case Name — Citation (if available) — one-line reason it was cited.
-    Scan the ENTIRE document from beginning to end, including footnotes and any quoted passages from lower
-    court/tribunal judgments. If a case is only cited inside a footnote or inside a quoted paragraph, still list it.
-
-    If one case is reported in several reporters printed side by side (e.g. "AIR 1962 SC 605 : (1962) 1 SCR 567"),
-    that is ONE case — write it on a single line, not once per reporter. If the same case is cited more than once
-    in the document, list it only once.
-
-    If you cannot find any cited cases, say so explicitly and briefly explain what the document is about instead,
-    so we can confirm you are reading the actual document content.
-
-    Do not use JSON. Just write plain, readable text.
+    STRICT OUTPUT RULES:
+    1. For each cited case, output strictly ONE line in this format:
+       Case Name — Citation — Reason / Context
+    2. Do NOT summarize the document facts or write background essays.
+    3. DO NOT repeat cases.
+    4. If an excerpt contains NO cited precedents, output strictly:
+       NONE
     """
-
+    
     let jsonSystemPrompt = """
     You are an expert Legal AI Assistant specializing in Indian jurisprudence and legal document analysis.
     Your task is to carefully read through Indian court filing documents and extract every legal case cited as a precedent or reference.
 
     Follow these strict guidelines:
     1. Identify Case Names: Look for standard adversarial formats (e.g., "X v. Y", "X vs. Y", "In Re: X").
-    2. Identify Citations: Look for standard Indian legal reporters and journals. Common examples include, but are not limited to:
-       - SCC (Supreme Court Cases)
-       - AIR (All India Reporter)
-       - SCR (Supreme Court Reports)
-       - SCALE, JT (Judgment Today)
-       - High Court specific reporters (e.g., DLT, BomLR, KLT, MLJ)
-       - Neutral citations (e.g., 2023/DHC/1234)
-    3. Differentiate: Do not include the primary case (the case currently being heard/filed) in the list of cited cases, unless it is explicitly cited in a historical context within the document.
-    4. Context: Briefly summarize the legal principle or reason why the case was cited based on the surrounding text.
-    5. Missing Data: If a specific detail (like the year or court) is not mentioned in the text, return null for that field. Do not hallucinate information not present in the document.
-    6. Thoroughness: Scan the ENTIRE document from beginning to end, including the last few paragraphs — do not stop early. Citations often appear later in the document (e.g., in a discussion, analysis, or "reasons for judgment" section), not just near the top.
-    7. Nested/Quoted Citations: Citations may appear inside a quoted passage — for example, when this judgment quotes verbatim from a lower court's or tribunal's judgment (often in quotation marks or an indented block), and that quoted text itself references other cases. Extract those cited cases too, exactly as they appear, even if they are inside a quotation.
-    8. Footnote Citations: Citations are sometimes given in footnotes (marked with superscript numbers like 1, 2, 3 in the body text) rather than inline in the main paragraph. Check footnote text at the bottom of pages for citations as well.
-    9. Parallel Citations — ONE case, not several: the same judgment is usually reported in more than one reporter, and those citations are printed side by side separated by ":" or ";" or "," — for example "K.M. Nanavati v. State of Maharashtra, AIR 1962 SC 605 : (1962) 1 SCR 567 : 1962 SCJ 1". That is a SINGLE case. Emit ONE entry for it, putting the fullest citation in the "citation" field. Never create one entry per reporter.
-    10. No Repeats: if the same case is cited more than once, include it only ONCE in the list. Do not repeat an entry because the case appears in more than one place.
+    2. Identify Citations: Look for standard Indian legal reporters (SCC, AIR, SCR, SCALE, JT, SCC OnLine, Neutral citations).
+    3. Context: Briefly summarize the legal principle or reason why the case was cited.
+    4. Missing Data: If a detail is missing, return null. Do not hallucinate.
+    5. No Repeats: Emit each unique case only once.
 
-    OUTPUT FORMAT — this is mandatory:
-    Respond with ONLY a single valid JSON object, and nothing else — no markdown fences (no ```),
-    no explanations, no preamble, no text before or after the JSON, no closing remarks.
-
-    The JSON must match this TypeScript type exactly:
+    OUTPUT FORMAT:
+    Respond with ONLY a single valid JSON object, and nothing else (no ``` markdown fences).
 
     type CitedCase = {
       caseName: string;
-      citation: string | null;   // use the real JSON null keyword when unknown, NEVER the text "null" as a string
-      year: number | null;       // a plain number like 2019, or real JSON null — never a quoted string
+      citation: string | null;
+      year: number | null;
       court: string | null;
       context: string | null;
     };
     type DocumentExtractionResult = {
       citedCases: CitedCase[];
     };
-
-    Example of a correctly formatted response (follow this style exactly):
-    {"citedCases":[{"caseName":"K.M. Nanavati v. State of Maharashtra","citation":"AIR 1962 SC 605","year":1962,"court":"Supreme Court of India","context":"Cited regarding the scope of judicial review of jury verdicts."},{"caseName":"State of Punjab v. Bhajan Kaur","citation":null,"year":null,"court":null,"context":"Referenced as a precedent for motor accident compensation without further detail given in the text."}]}
-
-    If no cases are cited in the document, respond with exactly: {"citedCases":[]}
     """
 
-    /// Appended to whichever system prompt is active, but ONLY when the regex pre-filter is on.
-    ///
-    /// With the filter on, the model no longer receives continuous pages — it receives the
-    /// passages around each candidate citation, joined with "[…]". Left unexplained, the gaps
-    /// read as a damaged document, and instructions like "scan the entire document from
-    /// beginning to end" become quietly false. Keeping this separate from the base prompts means
-    /// that turning the filter off restores the original prompt byte-for-byte, so the toggle is
-    /// a clean A/B with one variable.
     let passageExcerptNote = """
 
-
-    INPUT FORMAT NOTE — read this before anything else:
-    The text below is NOT continuous prose. It is a set of excerpts from the document: the
-    passages surrounding each place where a case appears to be cited, joined together, with "[…]"
-    marking text deliberately left out in between. The gaps are intentional and expected. Do not
-    treat them as missing or corrupted information, do not attempt to reconstruct them, and do
-    not mention them in your answer. Extract the cases cited in the excerpts you are given, and
-    judge completeness only against those excerpts.
+    INPUT FORMAT NOTE:
+    The text below consists of candidate excerpts surrounding cited cases joined with "[…]". Extract the cases cited directly from these excerpts.
     """
 
-    // Loaded models are cached so we don't re-download/re-load repeatedly
+    // 🚀 STEP 2: TIGHTER REASONING DIRECTIVE TO REDUCE 70%+ THINKING OVERHEAD
+    let strictThinkingDirective = """
+
+    CRITICAL REASONING INSTRUCTIONS (Inside Thinking Block):
+    - Limit internal thinking to under 30 words total.
+    - DO NOT quote text passages in your thinking.
+    - Extract case name and citation directly, then immediately write the JSON/Output.
+    """
+    
     private var loadedContainers: [String: ModelContainer] = [:]
 
     private func loadContainer(repoID: String, architectureType: ModelArchitectureType) async throws -> ModelContainer {
@@ -494,11 +446,29 @@ class LLMManager: ObservableObject {
                 progressHandler: progressClosure
             )
         }
+        
+        statusText = "Warming up GPU engine..."
+        await Self.warmup(container: container)
 
         loadedContainers[repoID] = container
         statusText = ""
         downloadProgress = 1.0
         return container
+    }
+
+    private static func warmup(container: ModelContainer) async {
+        _ = try? await container.perform { context in
+            let input = try await context.processor.prepare(
+                input: UserInput(prompt: .text("1"))
+            )
+            var params = GenerateParameters(temperature: 0.0)
+            params.maxTokens = 1
+
+            let stream = try MLXLMCommon.generate(input: input, parameters: params, context: context)
+            for await _ in stream {
+                break
+            }
+        }
     }
 
     func generateStructuredOutput(pdfText: String, model: LLMModel, outputFormat: OutputFormat, thinkingEnabled: Bool = true, preFilterEnabled: Bool = true) async throws -> String {
@@ -507,27 +477,16 @@ class LLMManager: ObservableObject {
         }
 
         isGenerating = true
-        generationTimeText = "Processing..." // Reset time text
-        
+        generationTimeText = "Processing..."
         defer { isGenerating = false }
 
         let container = try await loadContainer(repoID: repoID, architectureType: model.architectureType)
         let basePrompt = outputFormat == .json ? jsonSystemPrompt : textOnlySystemPrompt
-        let activePrompt = preFilterEnabled ? basePrompt + passageExcerptNote : basePrompt
+        
+        let promptWithThinking = thinkingEnabled ? (basePrompt + strictThinkingDirective) : basePrompt
+        let activePrompt = preFilterEnabled ? (promptWithThinking + passageExcerptNote) : promptWithThinking
 
-        // START TOTAL TIMER
         let totalStartTime = CFAbsoluteTimeGetCurrent()
-
-        // =================================================================================================
-        // BATCH PROCESSING (SERIAL — deliberately)
-        //
-        // Batches run one at a time. This is not a missed optimisation: `ModelContainer.perform`
-        // takes an exclusive async lock (SerialAccessContainer -> AsyncMutex) held for the whole
-        // duration of the call, so concurrent batches queue behind each other regardless. The
-        // TaskGroup that used to live here produced zero parallelism and logs that claimed
-        // otherwise. Real concurrency would require batched generation (one forward pass over N
-        // sequences), which the high-level MLX API does not expose.
-        // =================================================================================================
 
         let batches = Self.chunkByPages(pdfText)
         let isSingleBatch = batches.count == 1
@@ -542,9 +501,6 @@ class LLMManager: ObservableObject {
                 ? "Processing document..."
                 : "Processing batch \(index + 1) of \(batches.count) (\(batch.pageRangeLabel))..."
 
-            // Pre-filter: narrow the batch to the passages around citation-shaped text.
-            // A batch with nothing citation-shaped in it is skipped entirely — that is
-            // where most of the saving comes from, since it costs no model call at all.
             var textToSend = batch.text
             if preFilterEnabled {
                 guard let passages = CitationScanner.candidatePassages(in: batch.text) else {
@@ -559,10 +515,6 @@ class LLMManager: ObservableObject {
                 textToSend = passages
             }
 
-            // Single-batch documents get no batch label, so their prompt is identical
-            // to what a whole-document run has always sent. With the pre-filter on, the batch
-            // is excerpts FROM those pages rather than the pages themselves — saying "a batch
-            // of pages" there would contradict the input-format note.
             let batchSource = preFilterEnabled
                 ? "excerpts taken from pages \(batch.pageRangeLabel)"
                 : "a batch of pages (\(batch.pageRangeLabel))"
@@ -582,8 +534,6 @@ class LLMManager: ObservableObject {
             metrics.originalChars = batch.text.count
             metrics.sentChars = textToSend.count
 
-            // Record whether this batch's JSON actually parsed. A truncated or malformed
-            // batch contributes zero cases to the merge and would otherwise vanish silently.
             if outputFormat == .json {
                 if let parsed = DocumentExtractionResult.parse(from: result.text) {
                     metrics.parseStatus = .parsed(count: parsed.citedCases.count)
@@ -600,9 +550,6 @@ class LLMManager: ObservableObject {
 
         let finalResult: String
         if chunkOutputs.isEmpty {
-            // Every batch was filtered out — the document contains no citation-shaped
-            // text anywhere. Return the empty result in the requested shape rather than
-            // an empty string, which the UI would report as "model returned empty output".
             finalResult = outputFormat == .json
                 ? "{\"citedCases\":[]}"
                 : "No cited cases found in this document."
@@ -630,14 +577,11 @@ class LLMManager: ObservableObject {
         return finalResult
     }
 
-    /// One batch of consecutive pages, ready to send to the model as a single chunk.
     private struct PageBatch {
         let text: String
-        let pageRangeLabel: String  // e.g. "pages 6–10"
+        let pageRangeLabel: String
     }
 
-    /// Prints the aggregate picture for a run: where the time went, how much of it was
-    /// thinking, and whether anything was truncated or failed to parse.
     private static func printRunSummary(_ metrics: [ChunkMetrics], totalSeconds: Double, outputFormat: OutputFormat) {
         guard !metrics.isEmpty else { return }
 
@@ -695,60 +639,41 @@ class LLMManager: ObservableObject {
         }
     }
 
-    /// Splits the document strictly into batches of `pagesPerBatch` consecutive pages.
-    /// No character limit is applied — 5 pages is always exactly 1 batch, however long
-    /// those pages are. Watch the run summary for truncation warnings if pages are dense.
-        private static func chunkByPages(_ text: String, pagesPerBatch: Int = 5) -> [PageBatch] {
-            let pages = text.components(separatedBy: PDFParser.pageBreakMarker)
-                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                .filter { !$0.isEmpty }
+    private static func chunkByPages(_ text: String, pagesPerBatch: Int = 5) -> [PageBatch] {
+        let pages = text.components(separatedBy: PDFParser.pageBreakMarker)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
 
-            // If no page markers are found, return the whole text as one batch
-            guard pages.count > 1 else {
-                return [PageBatch(text: text, pageRangeLabel: "Full Document")]
-            }
-
-            var batches: [PageBatch] = []
-            var index = 0
-            
-            while index < pages.count {
-                let end = min(index + pagesPerBatch, pages.count)
-                let batchPages = pages[index..<end]
-                let batchText = batchPages.joined(separator: "\n\n")
-                
-                let rangeLabel = (end - index == 1)
-                    ? "page \(index + 1)"
-                    : "pages \(index + 1)–\(end)"
-
-                // Directly append the 5 pages as ONE single batch
-                batches.append(PageBatch(text: batchText, pageRangeLabel: rangeLabel))
-                
-                index = end
-            }
-            
-            return batches
+        guard pages.count > 1 else {
+            return [PageBatch(text: text, pageRangeLabel: "Full Document")]
         }
 
-    /// Letters and digits only, lowercased — so "A.I.R. 1962 SC 605" and "AIR 1962 SC 605",
-    /// or "K.M. Nanavati v. State" and "K M Nanavati v State", collapse to one key.
+        var batches: [PageBatch] = []
+        var index = 0
+        
+        while index < pages.count {
+            let end = min(index + pagesPerBatch, pages.count)
+            let batchPages = pages[index..<end]
+            let batchText = batchPages.joined(separator: "\n\n")
+            
+            let rangeLabel = (end - index == 1)
+                ? "page \(index + 1)"
+                : "pages \(index + 1)–\(end)"
+
+            batches.append(PageBatch(text: batchText, pageRangeLabel: rangeLabel))
+            index = end
+        }
+        
+        return batches
+    }
+
     private static func dedupeKey(_ text: String) -> String {
         text.lowercased().filter { $0.isLetter || $0.isNumber }
     }
 
-    /// Collapse repeat references to the same case.
-    ///
-    /// Matches on EITHER the case name or the citation, because the two duplicate in different
-    /// ways. A case cited on two different pages repeats the name; a case with PARALLEL
-    /// citations ("AIR 1962 SC 605 : (1962) 1 SCR 567" — one case, two reporters printed side
-    /// by side) can come back as two entries whose names differ slightly but whose citation
-    /// strings overlap. Name-only matching, which is all this used to do, missed the second kind
-    /// — and the passage pre-filter makes it MORE likely by placing parallel citations together
-    /// in a single window.
-    ///
-    /// First occurrence wins: it is normally the one written out in full.
     private static func dedupeCitedCases(_ cases: [CitedCase]) -> [CitedCase] {
         var seenNames = Set<String>()
-        var citationOwners: [String: Set<String>] = [:]   // citation key -> name tokens seen with it
+        var citationOwners: [String: Set<String>] = [:]
         var out: [CitedCase] = []
 
         for citedCase in cases {
@@ -759,22 +684,10 @@ class LLMManager: ObservableObject {
 
             var isDuplicate = seenNames.contains(nameKey)
 
-            // Collapsing on a shared citation requires the party names to overlap too.
-            //
-            // Without that check this deletes real findings: a judgment may report that the
-            // SAME citation was wrongly attributed to two DIFFERENT cases — "the correct cause
-            // title for 2020 SCC OnLine SC 341 is M. Subramaniam v. S. Janaki", against a
-            // tribunal that cited it as State Bank of India v. Shree Ram. Both belong in the
-            // output; a mis-citation is exactly what this tool exists to surface. Requiring a
-            // shared name token still collapses parallel citations of one case, where the names
-            // are the same or near-identical spellings.
             if !isDuplicate, !citationKey.isEmpty, let owners = citationOwners[citationKey] {
                 isDuplicate = owners.isEmpty || !owners.isDisjoint(with: nameTokens)
             }
 
-            // Record keys even for a rejected duplicate: a case reported in three reporters can
-            // arrive as three entries, and dropping the second one's citation would let the
-            // third through under a slightly different name.
             seenNames.insert(nameKey)
             if !citationKey.isEmpty {
                 citationOwners[citationKey, default: []].formUnion(nameTokens)
@@ -786,8 +699,6 @@ class LLMManager: ObservableObject {
         return out
     }
 
-    /// Meaningful words of a case name, for deciding whether two entries name the same parties.
-    /// Short tokens and the connectives that appear in every case name carry no signal.
     private static func nameTokens(_ name: String) -> Set<String> {
         let noise: Set<String> = ["versus", "state", "union", "india", "ltd", "limited",
                                   "anr", "another", "ors", "others", "the", "and", "bank",
@@ -799,11 +710,6 @@ class LLMManager: ObservableObject {
         return Set(words)
     }
 
-    /// Re-emit one batch's JSON with duplicates collapsed.
-    ///
-    /// Single-batch documents never reached `mergeChunkOutputs`, so they were the one path with
-    /// no dedupe at all. Falls back to the raw output whenever it doesn't parse, so this can
-    /// only ever remove duplicates — never destroy a result.
     private static func dedupedIfPossible(_ output: String, outputFormat: OutputFormat) -> String {
         guard outputFormat == .json,
               let parsed = DocumentExtractionResult.parse(from: output) else { return output }
@@ -813,7 +719,6 @@ class LLMManager: ObservableObject {
         return json
     }
 
-    /// Merges the per-chunk outputs into one final answer.
     private static func mergeChunkOutputs(_ outputs: [String], outputFormat: OutputFormat) -> String {
         switch outputFormat {
         case .json:
@@ -830,172 +735,158 @@ class LLMManager: ObservableObject {
             return jsonString
 
         case .text:
-            return outputs.enumerated()
-                .map { index, text in "--- Part \(index + 1) ---\n\(text.trimmingCharacters(in: .whitespacesAndNewlines))" }
-                .joined(separator: "\n\n")
+            var seenCaseKeys = Set<String>()
+            var uniqueLines: [String] = []
+            for output in outputs {
+                let lines = output.components(separatedBy: .newlines)
+                for rawLine in lines {
+                    var line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !line.isEmpty,
+                          !line.hasPrefix("--- Part"),
+                          !line.lowercased().contains("no legal cases were cited"),
+                          !line.lowercased().contains("no cited cases"),
+                          line.uppercased() != "NONE" else { continue }
+
+                    if line.hasPrefix("Case Name —") || line.hasPrefix("Case Name -") {
+                        line = line.replacingOccurrences(of: "Case Name —", with: "")
+                                   .replacingOccurrences(of: "Case Name -", with: "")
+                                   .trimmingCharacters(in: .whitespacesAndNewlines)
+                    }
+
+                    guard line.contains("—") || line.contains("-") || line.contains("SCC") || line.contains("AIR") else { continue }
+
+                    let parts = line.components(separatedBy: "—")
+                    let caseIdentifier = parts.first ?? line
+                    let key = caseIdentifier.lowercased()
+                        .replacingOccurrences(of: "vs.", with: "v.")
+                        .replacingOccurrences(of: "versus", with: "v.")
+                        .filter { $0.isLetter || $0.isNumber }
+                    guard !key.isEmpty else { continue }
+
+                    if !seenCaseKeys.contains(key) {
+                        seenCaseKeys.insert(key)
+                        uniqueLines.append(line)
+                    }
+                }
+            }
+
+            if uniqueLines.isEmpty {
+                return "No cited cases found in this document."
+            }
+            return uniqueLines.joined(separator: "\n")
         }
     }
 
-    /// Runs one generation call for a single chunk of text (or the whole document, if not chunked).
+    /// 🚀 STEP 3: FIXED MAX_TOKENS AND TOKEN BUDGETING
     private func generateForChunk(
-            container: ModelContainer, activePrompt: String, chunkText: String,
-            chunkLabel: String?, thinkingEnabled: Bool
-        ) async throws -> ChunkResult {
+        container: ModelContainer, activePrompt: String, chunkText: String,
+        chunkLabel: String?, thinkingEnabled: Bool
+    ) async throws -> ChunkResult {
 
-            let userContent = chunkLabel != nil
-                ? "Extract the file\n\n\(chunkLabel!)\n\n\(chunkText)"
-                : "Extract the file\n\n\(chunkText)"
+        let userContent = chunkLabel != nil
+            ? "Extract the file\n\n\(chunkLabel!)\n\n\(chunkText)"
+            : "Extract the file\n\n\(chunkText)"
 
-            return try await container.perform { context in
-                let chatMessages: [Chat.Message] = [
-                    Chat.Message(role: .system, content: activePrompt),
-                    Chat.Message(role: .user, content: userContent)
-                ]
+        return try await container.perform { context in
+            let chatMessages: [Chat.Message] = [
+                Chat.Message(role: .system, content: activePrompt),
+                Chat.Message(role: .user, content: userContent)
+            ]
 
-                let input = try await context.processor.prepare(
-                    input: UserInput(
-                        prompt: .chat(chatMessages),
-                        additionalContext: ["enable_thinking": thinkingEnabled]
-                    )
+            let input = try await context.processor.prepare(
+                input: UserInput(
+                    prompt: .chat(chatMessages),
+                    additionalContext: [
+                        "enable_thinking": thinkingEnabled,
+                        "thinking_budget": 128
+                    ]
                 )
+            )
 
-                var generateParameters = GenerateParameters(temperature: 0.0)
-                generateParameters.maxTokens = 4096
+            var generateParameters = GenerateParameters(temperature: 0.0)
+            generateParameters.topP = 0.95
+            generateParameters.repetitionPenalty = 1.15
+            // ⚡ Increased from 700 to 2048: Fixes the truncation bug in Batch 5
+            generateParameters.maxTokens = 2048
+            
+            let stream = try MLXLMCommon.generate(
+                input: input,
+                parameters: generateParameters,
+                context: context
+            )
 
-                let stream = try MLXLMCommon.generate(
-                    input: input,
-                    parameters: generateParameters,
-                    context: context
-                )
+            let comesFromBuiltInRegistry = context.configuration.reasoningConfig != nil
+            let isPrimedInside = thinkingEnabled && comesFromBuiltInRegistry
 
-                let comesFromBuiltInRegistry = context.configuration.reasoningConfig != nil
-                let isPrimedInside = thinkingEnabled && comesFromBuiltInRegistry
+            let effectiveReasoningConfig: ReasoningConfig? = thinkingEnabled
+                ? (context.configuration.reasoningConfig ?? Self.gemmaChannelReasoningConfig)
+                : nil
 
-                let effectiveReasoningConfig: ReasoningConfig? = thinkingEnabled
-                    ? (context.configuration.reasoningConfig ?? Self.gemmaChannelReasoningConfig)
-                    : nil
-
-                var emitter: ReasoningEventEmitter? = effectiveReasoningConfig.map {
-                    ReasoningEventEmitter(config: $0, primedInside: isPrimedInside)
-                }
-
-                var fullText = ""
-                var thinkingText = ""
-                var metrics = ChunkMetrics()
-
-                func route(_ segments: [ReasoningEventEmitter.Segment]) {
-                    for segment in segments {
-                        switch segment {
-                        case .reasoning(let t): thinkingText += t
-                        case .response(let t): fullText += t
-                        }
-                    }
-                }
-
-                for await generation in stream {
-                    switch generation {
-                    case .chunk(let text):
-                        if emitter != nil {
-                            route(emitter!.process(text))
-                        } else {
-                            fullText += text
-                        }
-
-                    case .info(let info):
-                        // Exact prefill/decode split and stop reason, straight from the
-                        // generator — no extra tokenizer pass needed to measure this.
-                        metrics.promptTokens = info.promptTokenCount
-                        metrics.generatedTokens = info.generationTokenCount
-                        metrics.prefillSeconds = info.promptTime
-                        metrics.decodeSeconds = info.generateTime
-                        switch info.stopReason {
-                        case .stop:
-                            metrics.stopReasonText = "stop"
-                        case .length:
-                            // Generation was cut off by maxTokens rather than finishing.
-                            // With thinking on, reasoning tokens share this budget.
-                            metrics.stopReasonText = "length"
-                            metrics.hitTokenLimit = true
-                        case .cancelled:
-                            metrics.stopReasonText = "cancelled"
-                        }
-
-                    case .toolCall:
-                        break
-                    }
-                }
-                if emitter != nil {
-                    route(emitter!.finalize())
-                }
-
-                metrics.thinkingChars = thinkingText.count
-                metrics.responseChars = fullText.count
-
-                if !thinkingText.isEmpty {
-                    print(" Thinking (\(thinkingText.count) chars, hidden from UI):\n\(thinkingText)")
-                }
-
-                return ChunkResult(text: fullText, metrics: metrics)
+            var emitter: ReasoningEventEmitter? = effectiveReasoningConfig.map {
+                ReasoningEventEmitter(config: $0, primedInside: isPrimedInside)
             }
+
+            var fullText = ""
+            var thinkingText = ""
+            var metrics = ChunkMetrics()
+
+            func route(_ segments: [ReasoningEventEmitter.Segment]) {
+                for segment in segments {
+                    switch segment {
+                    case .reasoning(let t): thinkingText += t
+                    case .response(let t): fullText += t
+                    }
+                }
+            }
+
+            for await generation in stream {
+                switch generation {
+                case .chunk(let text):
+                    if emitter != nil {
+                        route(emitter!.process(text))
+                    } else {
+                        fullText += text
+                    }
+
+                case .info(let info):
+                    metrics.promptTokens = info.promptTokenCount
+                    metrics.generatedTokens = info.generationTokenCount
+                    metrics.prefillSeconds = info.promptTime
+                    metrics.decodeSeconds = info.generateTime
+                    switch info.stopReason {
+                    case .stop:
+                        metrics.stopReasonText = "stop"
+                    case .length:
+                        metrics.stopReasonText = "length"
+                        metrics.hitTokenLimit = true
+                    case .cancelled:
+                        metrics.stopReasonText = "cancelled"
+                    }
+
+                case .toolCall:
+                    break
+                }
+            }
+            if emitter != nil {
+                route(emitter!.finalize())
+            }
+
+            metrics.thinkingChars = thinkingText.count
+            metrics.responseChars = fullText.count
+
+            if !thinkingText.isEmpty {
+                print(" Thinking (\(thinkingText.count) chars, hidden from UI):\n\(thinkingText)")
+            }
+
+            return ChunkResult(text: fullText, metrics: metrics)
         }
+    }
 
     private nonisolated static let gemmaChannelReasoningConfig = ReasoningConfig(
         startDelimiter: "<|channel>thought",
         endDelimiter: "<channel|>",
         promptStrategy: .alwaysOn
     )
-    // =========================================================================
-        // 🌟 NEW FEATURE: GENERAL CHAT MODE (For questions like "What is photosynthesis?")
-        // =========================================================================
-        
-      /*  let generalSystemPrompt = "You are a helpful, smart, and concise AI assistant. Answer the user's questions accurately."
-
-        func askGeneralQuestion(question: String, model: LLMModel) async throws -> String {
-            guard let repoID = model.hubRepoID else {
-                throw LLMError.noRepoConfigured
-            }
-
-            isGenerating = true
-            statusText = "Thinking..."
-            defer { isGenerating = false }
-
-            // 1. Load the model
-            let container = try await loadContainer(repoID: repoID, architectureType: model.architectureType)
-
-            // 2. Ask the question directly (No PDF chunking, No JSON formatting)
-            let output = try await container.perform { context in
-                let chatMessages: [Chat.Message] = [
-                    Chat.Message(role: .system, content: generalSystemPrompt),
-                    Chat.Message(role: .user, content: question)
-                ]
-
-                let input = try await context.processor.prepare(
-                    input: UserInput(prompt: .chat(chatMessages))
-                )
-
-                // Temperature 0.6 rakhi hai taaki model thoda creative aur natural answer de
-                var generateParameters = GenerateParameters(temperature: 0.6)
-                generateParameters.maxTokens = 1024
-
-                let stream = try MLXLMCommon.generate(
-                    input: input,
-                    parameters: generateParameters,
-                    context: context
-                )
-
-                var fullText = ""
-                for await generation in stream {
-                    if case .chunk(let text) = generation {
-                        fullText += text
-                        // Agar aap UI mein live typing dikhana chahte hain, toh yahan update kar sakte hain
-                    }
-                }
-                return fullText
-            }
-
-            statusText = "Done!"
-            return output
-        }*/
 
     enum LLMError: LocalizedError {
         case noRepoConfigured

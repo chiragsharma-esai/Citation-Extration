@@ -132,12 +132,21 @@ enum LLMModel: String, CaseIterable, Identifiable {
 class PDFParser {
     static let pageBreakMarker = "\u{0}<<<PDF_PAGE_BREAK>>>\u{0}"
 
+    static func cleanFootnoteMarkers(_ text: String) -> String {
+        let pattern = "([A-Za-z])(\\d)"
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return text }
+        let nsString = text as NSString
+        let fullRange = NSRange(location: 0, length: nsString.length)
+        return regex.stringByReplacingMatches(in: text, range: fullRange, withTemplate: "$1 $2")
+    }
+
     static func extractText(from url: URL) -> String? {
         guard let pdf = PDFDocument(url: url) else { return nil }
         var pageTexts: [String] = []
         for i in 0..<pdf.pageCount {
             guard let page = pdf.page(at: i) else { continue }
-            pageTexts.append(page.string ?? "")
+            let rawText = page.string ?? ""
+            pageTexts.append(cleanFootnoteMarkers(rawText))
         }
         return pageTexts.joined(separator: "\n\n\(pageBreakMarker)\n\n")
     }
@@ -175,7 +184,11 @@ private struct ManualHubDownloader: MLXLMCommon.Downloader {
 }
 
 private struct ManualTokenizerBridge: MLXLMCommon.Tokenizer {
-    private let upstream: any Tokenizers.Tokenizer
+    private var upstream: any Tokenizers.Tokenizer {
+        didSet {
+            // Unused but required
+        }
+    }
 
     init(_ upstream: any Tokenizers.Tokenizer) {
         self.upstream = upstream
@@ -304,52 +317,178 @@ struct ChunkResult: Sendable {
     let metrics: ChunkMetrics
 }
 
-// MARK: - 🚀 STEP 1: UNCOMMENTED & OPTIMIZED CITATION SCANNER
-// Correctly skips batches with only header/procedural information (e.g. Batch 1)
-/*struct CitationScanner {
-    private static let citationRegex: NSRegularExpression? = {
-        let pattern = #"""
-        (?ix)
-        \b(
-            # Adversarial patterns (Party v. Party)
-            \b[A-Z][A-Za-z0-9\.\s]{2,35}\s+(?:v\.|vs\.|versus)\s+[A-Z][A-Za-z0-9\.\s]{2,35}\b
-            |
-            # Standard Indian & Commonwealth Reporters
-            (?:\(\d{4}\)|\b\d{4}\b)\s*(\d+)?\s*(?:SCC|AIR|SCR|SCALE|JT|DLT|Bom\s*CR|Bom\s*LR|KLT|MLJ|All\s*LJ|BLJ|ILR|Cr\.?L\.?J|EWHC|UKSC)\s*(?:\([A-Z]+\))?\s*\d+
-            |
-            # SCC OnLine & Neutral Citations
-            \b\d{4}\s*(?:SCC\s+OnLine|INSC|\/[A-Z]{3,4}\/|EWHC)\s+[A-Z0-9\s]+\b
-        )
-        """#
-        return try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive])
+// MARK: - 🚀 STEP 1: UNIVERSAL HIGH-PRECISION CITATION SCANNER
+enum CitationScanner {
+    
+    static let defaultSentenceWindow = 2
+
+    private static let reporterTokens: [String] = [
+        "ELT", "AIR", "ITR", "SCC", "CRLJ", "CTR", "TAXMAN", "LLJ",
+        "DLT", "Scale", "RLT", "STC", "SCR", "JT", "TTJ", "ITD",
+        "ECR", "CPJ", "CLR", "AD", "Supreme", "DRJ", "SLT", "SLR",
+        "STR", "ARBLR", "SCJ", "AllMR", "UJ", "FLR", "SRJ", "Crimes",
+        "KarLJ", "LLN", "CCC", "KLT", "LIC", "CCR", "CTJ", "SLJ",
+        "TLR", "PTC", "ATC", "CTC", "RCR", "CPR", "FJR", "VST",
+        "MLJ", "JCC", "RecentCR", "CLT", "ALT", "SLJCAT", "CLJ", "RentLR",
+        "RCJ", "FAC", "DRTC", "SOT", "CRJ", "ECC", "CompLJ", "CLA",
+        "CLC", "SCW", "CCrC", "CHN", "DMC", "ACC", "ILR", "ALLMR",
+        "KHCACJ", "HLR", "ATR", "ETR", "AIC", "BCR", "OCR", "ITJ",
+        "MTJ", "TAXATION", "ALR", "BankCLR", "MPLJ", "ACJ", "BLJR", "ALJ",
+        "AnWR", "RRR", "GLR", "STT", "PunjLR", "AnLT", "GLH", "MhLJ",
+        "MahLJ", "AllER", "CutLT", "KerLR", "LILR", "BLR", "VKN", "KLJ",
+        "AllCriC", "SCL", "GujLR", "PLR", "JKLR", "GCD", "PLJR", "RLR",
+        "GujLH", "OELT", "BLJ", "BomLR", "KerLJ", "MIA", "SCt", "UPLBEC",
+        "SarPCJ", "ACE", "WLR", "CalLT", "MWN", "TAC", "SCC OnLine",
+        "EWHC", "UKSC" // ⚡ ADDED: UK / Commonwealth reporters to universally capture Anthony Cork precedent
+    ]
+
+    private static let neutralTokens: [String] = [
+        "APHC", "KER", "KHC", "RJ-JD", "CGHC", "INSC", "MPHC-JBP", "GUJHC",
+        "HHC", "MPHC-IND", "MPHC-GWL", "RJ-JP", "DHC", "BHC-NAG", "MHC", "BHC-AUG",
+        "PHHC", "AHC", "GAU-AS", "KHC-D", "MLHC", "KHC-K", "AHC-LKO", "BHC-OS",
+        "BHC-GOA", "CHC-AS", "SHC", "THC", "CHC-OS", "JHHC", "BHC-KOL", "CHC-PB",
+        "BHC-AS", "JKLHC-JMU", "UHC", "JKLHC-SGR", "OHC", "CHC-JP"
+    ]
+
+    static var includePartyMarker = true
+
+    private static let citationRegex: NSRegularExpression = {
+        func tolerant(_ token: String) -> String {
+            let escaped = NSRegularExpression.escapedPattern(for: token)
+            guard token.allSatisfy({ $0.isUppercase || $0 == "&" || $0 == " " }) else { return escaped }
+            return token.map { "\(NSRegularExpression.escapedPattern(for: String($0)))\\.?" }.joined()
+        }
+
+        let tokens = (reporterTokens + neutralTokens)
+            .sorted { ($0.count, $0) > ($1.count, $1) }
+            .map(tolerant)
+            .joined(separator: "|")
+
+        var pattern = "(?<![A-Za-z])(?:\(tokens))(?:\\s*\\([A-Za-z&.\\- ]{1,14}\\))?(?![A-Za-z])"
+
+        if includePartyMarker {
+            pattern += "|(?<=\\w[\\s\\-])(?i:v|vs|v/s)\\.?(?=[\\s\\-,;:]|$)|(?i:\\bversus\\b)"
+        }
+
+        return try! NSRegularExpression(pattern: pattern, options: [])
     }()
 
-    static func candidatePassages(in text: String, windowSize: Int = 400) -> String? {
-        guard let regex = citationRegex else { return text }
-        let nsString = text as NSString
-        let matches = regex.matches(in: text, options: [], range: NSRange(location: 0, length: nsString.length))
+    private static let abbreviations = "No|Nos|Art|Sec|Cl|Ors|Anr|Ltd|Pvt|Co|Corp|Govt|Hon|Mr|Mrs|Ms|Dr|Prof|Rs|Vol|para|paras|pp|Ed|vs|v|etc|viz|Cri|Cr|LJ|JJ|AIR|ILR|SCC|SCR"
 
+    private static func sentenceStarts(in text: NSString) -> [Int] {
+        var masked = text as String
+
+        func mask(_ pattern: String, _ template: String) {
+            guard let re = try? NSRegularExpression(pattern: pattern) else { return }
+            let full = NSRange(location: 0, length: (masked as NSString).length)
+            masked = re.stringByReplacingMatches(in: masked, range: full, withTemplate: template)
+        }
+
+        mask("(?<=\\d)\\.(?=\\d)", "\u{0}")
+        mask("(?<![A-Za-z])([A-Za-z])\\.", "$1\u{0}")
+        mask("\\b(\(abbreviations))\\.", "$1\u{0}")
+
+        guard let re = try? NSRegularExpression(pattern: "(?<=[.!?])\\s+|\\n{2,}") else { return [0] }
+        let full = NSRange(location: 0, length: (masked as NSString).length)
+        var starts = [0]
+        re.enumerateMatches(in: masked, range: full) { match, _, _ in
+            if let end = match?.range.upperBound, end < text.length { starts.append(end) }
+        }
+        return starts
+    }
+
+    private static func isPureHeaderSentence(_ sentence: String) -> Bool {
+        // FIXED: Increased guard limit to 350 characters so Page 1's title block (267 chars) skips cleanly
+        guard sentence.count < 350 else { return false }
+        
+        let upper = sentence.uppercased()
+        let hasHeaderMarker = (upper.contains("APPELLANT") && upper.contains("RESPONDENT")) ||
+                              (upper.contains("PETITIONER") && upper.contains("RESPONDENT")) ||
+                              (upper.contains("IN THE SUPREME COURT") || upper.contains("IN THE HIGH COURT"))
+
+        let hasJudicialVerb = upper.contains("HELD") || upper.contains("RELIED") || upper.contains("OBSERVED") || upper.contains("CITED") || upper.contains("FOLLOWED")
+
+        return hasHeaderMarker && !hasJudicialVerb
+    }
+
+    static func containsCitation(_ text: String) -> Bool {
+        let ns = text as NSString
+        return citationRegex.firstMatch(in: text, range: NSRange(location: 0, length: ns.length)) != nil
+    }
+
+    static func candidatePassages(in text: String, window: Int = defaultSentenceWindow) -> String? {
+        let ns = text as NSString
+        let full = NSRange(location: 0, length: ns.length)
+        let matches = citationRegex.matches(in: text, range: full)
         guard !matches.isEmpty else { return nil }
 
-        var mergedRanges: [NSRange] = []
+        let starts = sentenceStarts(in: ns)
+
+        func sentenceIndex(of offset: Int) -> Int {
+            var low = 0, high = starts.count - 1, result = 0
+            while low <= high {
+                let mid = (low + high) / 2
+                if starts[mid] <= offset { result = mid; low = mid + 1 } else { high = mid - 1 }
+            }
+            return result
+        }
+
+        var ranges: [(lo: Int, hi: Int)] = []
 
         for match in matches {
-            let start = max(0, match.range.location - windowSize)
-            let end = min(nsString.length, match.range.location + match.range.length + windowSize)
-            let expandedRange = NSRange(location: start, length: end - start)
+            let i = sentenceIndex(of: match.range.location)
+            let sentenceStart = starts[i]
+            let sentenceEnd = (i + 1 < starts.count) ? starts[i + 1] : ns.length
+            let matchSentence = ns.substring(with: NSRange(location: sentenceStart, length: sentenceEnd - sentenceStart))
 
-            if let last = mergedRanges.last, NSIntersectionRange(last, expandedRange).length > 0 || last.location + last.length >= expandedRange.location {
-                let unionRange = NSUnionRange(last, expandedRange)
-                mergedRanges[mergedRanges.count - 1] = unionRange
+            if isPureHeaderSentence(matchSentence) {
+                continue
+            }
+
+            let lo = starts[max(0, i - window)]
+            let hiIndex = i + window + 1
+            let hi = hiIndex < starts.count ? starts[hiIndex] : ns.length
+
+            ranges.append((lo: min(lo, match.range.location), hi: max(hi, match.range.upperBound)))
+        }
+
+        guard !ranges.isEmpty else { return nil }
+
+        var merged: [(lo: Int, hi: Int)] = []
+        for range in ranges.sorted(by: { $0.lo < $1.lo }) {
+            if let last = merged.last, range.lo <= last.hi {
+                merged[merged.count - 1].hi = max(last.hi, range.hi)
             } else {
-                mergedRanges.append(expandedRange)
+                merged.append(range)
             }
         }
 
-        let passages = mergedRanges.map { nsString.substring(with: $0).trimmingCharacters(in: .whitespacesAndNewlines) }
+        var passages = merged.map {
+            ns.substring(with: NSRange(location: $0.lo, length: $0.hi - $0.lo))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }.filter { !$0.isEmpty }
+
+        let lines = text.components(separatedBy: .newlines)
+        let footnoteLines = lines.filter { line in
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let firstChar = trimmed.first, firstChar.isNumber else { return false }
+            return trimmed.contains("SCC") || trimmed.contains("AIR") || trimmed.contains("INSC") || trimmed.contains("Supp") || trimmed.contains("Judges") || trimmed.contains("EWHC")
+        }
+
+        if !footnoteLines.isEmpty {
+            let footnotesBlock = "FOOTNOTES FOR THIS PAGE:\n" + footnoteLines.joined(separator: "\n")
+            passages.append(footnotesBlock)
+        }
+
         return passages.joined(separator: "\n\n[…]\n\n")
     }
-}*/
+}
+
+// MARK: - ⚡ SHARED STREAM STATE MANAGER
+class GenerationStreamState {
+    var hasStreamedThinkingHeader = false
+    var hasStreamedResponseHeader = false
+}
 
 // MARK: - LLM Manager
 @MainActor
@@ -370,6 +509,7 @@ class LLMManager: ObservableObject {
     3. DO NOT repeat cases.
     4. If an excerpt contains NO cited precedents, output strictly:
        NONE
+    5. NEVER treat a footnote number (e.g., 1, 2) or a bare year (e.g., (1973), (1994)) as a Case Name. Footnotes are strictly citation details. Combine them with the case names they describe.
     """
     
     let jsonSystemPrompt = """
@@ -382,6 +522,7 @@ class LLMManager: ObservableObject {
     3. Context: Briefly summarize the legal principle or reason why the case was cited.
     4. Missing Data: If a detail is missing, return null. Do not hallucinate.
     5. No Repeats: Emit each unique case only once.
+    6. NEVER extract footnote numbers or naked years as case names. Combine them into the citation field.
 
     OUTPUT FORMAT:
     Respond with ONLY a single valid JSON object, and nothing else (no ``` markdown fences).
@@ -404,13 +545,13 @@ class LLMManager: ObservableObject {
     The text below consists of candidate excerpts surrounding cited cases joined with "[…]". Extract the cases cited directly from these excerpts.
     """
 
-    // 🚀 STEP 2: TIGHTER REASONING DIRECTIVE TO REDUCE 70%+ THINKING OVERHEAD
     let strictThinkingDirective = """
 
-    CRITICAL REASONING INSTRUCTIONS (Inside Thinking Block):
-    - Limit internal thinking to under 30 words total.
-    - DO NOT quote text passages in your thinking.
-    - Extract case name and citation directly, then immediately write the JSON/Output.
+    REASONING GUIDELINE (Inside <|channel>thought):
+    - Write your thoughts as a natural, conversational stream-of-consciousness (thinking out loud).
+    - Avoid robotic templates, repeating lines, "1. Analyze", "Step 1", or structured tables.
+    - Start directly with conversational phrases like: "Let's look at paragraph...", "Scanning this chunk...", "I see footnote 1 maps to..."
+    - Keep thoughts fluid, conversational, and under 50 words total. Do not write "Thinking Process:" or "Thinking:" as the UI displays it.
     """
     
     private var loadedContainers: [String: ModelContainer] = [:]
@@ -458,8 +599,9 @@ class LLMManager: ObservableObject {
 
     private static func warmup(container: ModelContainer) async {
         _ = try? await container.perform { context in
+            // ⚡ FIXED: Warmup runs with a realistic 40-token prompt so the Metal compiler compiles all necessary layers on startup.
             let input = try await context.processor.prepare(
-                input: UserInput(prompt: .text("1"))
+                input: UserInput(prompt: .text("Extract cited legal precedents and cases from the provided document excerpts."))
             )
             var params = GenerateParameters(temperature: 0.0)
             params.maxTokens = 1
@@ -471,7 +613,14 @@ class LLMManager: ObservableObject {
         }
     }
 
-    func generateStructuredOutput(pdfText: String, model: LLMModel, outputFormat: OutputFormat, thinkingEnabled: Bool = true, preFilterEnabled: Bool = true) async throws -> String {
+    func generateStructuredOutput(
+        pdfText: String,
+        model: LLMModel,
+        outputFormat: OutputFormat,
+        thinkingEnabled: Bool = true,
+        preFilterEnabled: Bool = true,
+        onToken: @MainActor @escaping (String) -> Void
+    ) async throws -> String {
         guard let repoID = model.hubRepoID else {
             throw LLMError.noRepoConfigured
         }
@@ -493,6 +642,10 @@ class LLMManager: ObservableObject {
 
         var chunkOutputs: [String] = []
         var allMetrics: [ChunkMetrics] = []
+
+        await onToken("")
+
+        let streamState = GenerationStreamState()
 
         for (index, batch) in batches.enumerated() {
             let batchLabel = "\(index + 1)/\(batches.count) \(batch.pageRangeLabel)"
@@ -525,8 +678,13 @@ class LLMManager: ObservableObject {
             print("▶️ [START] Batch \(index + 1)/\(batches.count) (\(batch.pageRangeLabel))...")
 
             let result = try await generateForChunk(
-                container: container, activePrompt: activePrompt, chunkText: textToSend,
-                chunkLabel: label, thinkingEnabled: thinkingEnabled
+                container: container,
+                activePrompt: activePrompt,
+                chunkText: textToSend,
+                chunkLabel: label,
+                thinkingEnabled: thinkingEnabled,
+                streamState: streamState,
+                onToken: onToken
             )
 
             var metrics = result.metrics
@@ -639,7 +797,8 @@ class LLMManager: ObservableObject {
         }
     }
 
-    private static func chunkByPages(_ text: String, pagesPerBatch: Int = 5) -> [PageBatch] {
+    // ⚡ FIXED: Page Batching size set to 1. Skips all empty pages instantly (0.0s delay), preventing GPU thermal throttling.
+    private static func chunkByPages(_ text: String, pagesPerBatch: Int = 1) -> [PageBatch] {
         let pages = text.components(separatedBy: PDFParser.pageBreakMarker)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
@@ -672,31 +831,33 @@ class LLMManager: ObservableObject {
     }
 
     private static func dedupeCitedCases(_ cases: [CitedCase]) -> [CitedCase] {
+        var uniqueCases: [CitedCase] = []
+        var seenCitations = Set<String>()
         var seenNames = Set<String>()
-        var citationOwners: [String: Set<String>] = [:]
-        var out: [CitedCase] = []
 
-        for citedCase in cases {
-            let nameKey = dedupeKey(citedCase.caseName)
-            guard !nameKey.isEmpty else { continue }
-            let citationKey = citedCase.citation.map(dedupeKey) ?? ""
-            let nameTokens = Self.nameTokens(citedCase.caseName)
+        for c in cases {
+            let cleanName = c.caseName.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !cleanName.isEmpty, cleanName.lowercased() != "none", cleanName.lowercased() != "unknown case" else { continue }
 
+            let nameKey = dedupeKey(cleanName)
+            let currentCitation = c.citation?.lowercased().filter { $0.isLetter || $0.isNumber } ?? ""
+
+            // Strict matching prevents false duplicate collapses on common opponent names like "Union of India" [1]
             var isDuplicate = seenNames.contains(nameKey)
 
-            if !isDuplicate, !citationKey.isEmpty, let owners = citationOwners[citationKey] {
-                isDuplicate = owners.isEmpty || !owners.isDisjoint(with: nameTokens)
+            if !isDuplicate, !currentCitation.isEmpty {
+                isDuplicate = seenCitations.contains(currentCitation)
             }
 
-            seenNames.insert(nameKey)
-            if !citationKey.isEmpty {
-                citationOwners[citationKey, default: []].formUnion(nameTokens)
+            if !isDuplicate {
+                seenNames.insert(nameKey)
+                if !currentCitation.isEmpty {
+                    seenCitations.insert(currentCitation)
+                }
+                uniqueCases.append(c)
             }
-
-            if isDuplicate { continue }
-            out.append(citedCase)
         }
-        return out
+        return uniqueCases
     }
 
     private static func nameTokens(_ name: String) -> Set<String> {
@@ -720,67 +881,77 @@ class LLMManager: ObservableObject {
     }
 
     private static func mergeChunkOutputs(_ outputs: [String], outputFormat: OutputFormat) -> String {
-        switch outputFormat {
-        case .json:
-            var all: [CitedCase] = []
-            for output in outputs {
-                guard let parsed = DocumentExtractionResult.parse(from: output) else { continue }
-                all.append(contentsOf: parsed.citedCases)
-            }
-            let result = DocumentExtractionResult(citedCases: dedupeCitedCases(all))
-            guard let data = try? JSONEncoder().encode(result),
-                  let jsonString = String(data: data, encoding: .utf8) else {
-                return outputs.joined(separator: "\n\n")
-            }
-            return jsonString
+        var allCases: [CitedCase] = []
 
-        case .text:
-            var seenCaseKeys = Set<String>()
-            var uniqueLines: [String] = []
-            for output in outputs {
+        for output in outputs {
+            if let parsed = DocumentExtractionResult.parse(from: output) {
+                allCases.append(contentsOf: parsed.citedCases)
+            } else {
                 let lines = output.components(separatedBy: .newlines)
-                for rawLine in lines {
-                    var line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
-                    guard !line.isEmpty,
-                          !line.hasPrefix("--- Part"),
-                          !line.lowercased().contains("no legal cases were cited"),
-                          !line.lowercased().contains("no cited cases"),
-                          line.uppercased() != "NONE" else { continue }
-
-                    if line.hasPrefix("Case Name —") || line.hasPrefix("Case Name -") {
-                        line = line.replacingOccurrences(of: "Case Name —", with: "")
-                                   .replacingOccurrences(of: "Case Name -", with: "")
-                                   .trimmingCharacters(in: .whitespacesAndNewlines)
+                for line in lines {
+                    let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !trimmed.isEmpty,
+                          !trimmed.hasPrefix("---"),
+                          !trimmed.lowercased().contains("no legal cases were cited"),
+                          !trimmed.lowercased().contains("no cited cases"),
+                          trimmed.uppercased() != "NONE" else { continue }
+                    
+                    var normalizedLine = trimmed
+                    if normalizedLine.hasPrefix("Case Name —") || normalizedLine.hasPrefix("Case Name -") {
+                        normalizedLine = normalizedLine.replacingOccurrences(of: "Case Name —", with: "")
+                                                       .replacingOccurrences(of: "Case Name -", with: "")
+                                                       .trimmingCharacters(in: .whitespacesAndNewlines)
                     }
 
-                    guard line.contains("—") || line.contains("-") || line.contains("SCC") || line.contains("AIR") else { continue }
+                    guard normalizedLine.contains("—") || normalizedLine.contains("-") || normalizedLine.contains("SCC") || normalizedLine.contains("AIR") else { continue }
 
-                    let parts = line.components(separatedBy: "—")
-                    let caseIdentifier = parts.first ?? line
-                    let key = caseIdentifier.lowercased()
-                        .replacingOccurrences(of: "vs.", with: "v.")
-                        .replacingOccurrences(of: "versus", with: "v.")
-                        .filter { $0.isLetter || $0.isNumber }
-                    guard !key.isEmpty else { continue }
-
-                    if !seenCaseKeys.contains(key) {
-                        seenCaseKeys.insert(key)
-                        uniqueLines.append(line)
-                    }
+                    let parts = normalizedLine.components(separatedBy: "—")
+                    let name = parts.first?.trimmingCharacters(in: .whitespacesAndNewlines) ?? normalizedLine
+                    let cit = parts.count > 1 ? parts[1].trimmingCharacters(in: .whitespacesAndNewlines) : nil
+                    let ctx = parts.count > 2 ? parts[2].trimmingCharacters(in: .whitespacesAndNewlines) : nil
+                    
+                    let normalizedName = name.replacingOccurrences(of: "Case Name —", with: "")
+                                             .replacingOccurrences(of: "Case Name -", with: "")
+                                             .trimmingCharacters(in: .whitespacesAndNewlines)
+                    
+                    allCases.append(CitedCase(caseName: normalizedName, citation: cit, year: nil, court: nil, context: ctx))
                 }
             }
+        }
 
-            if uniqueLines.isEmpty {
-                return "No cited cases found in this document."
+        let deduped = dedupeCitedCases(allCases)
+
+        if deduped.isEmpty {
+            return outputFormat == .json ? "{\"citedCases\":[]}" : "No cited cases found in this document."
+        }
+
+        switch outputFormat {
+        case .json:
+            let result = DocumentExtractionResult(citedCases: deduped)
+            if let data = try? JSONEncoder().encode(result), let json = String(data: data, encoding: .utf8) {
+                return json
             }
-            return uniqueLines.joined(separator: "\n")
+            return "{\"citedCases\":[]}"
+
+        case .text:
+            //  FIXED: Prepended "Case Name — " uniformly to each output line in Text format [1]
+            return deduped.map { c in
+                var line = "Case Name — " + c.caseName
+                if let citation = c.citation, !citation.isEmpty { line += " — \(citation)" }
+                if let context = c.context, !context.isEmpty { line += " — \(context)" }
+                return line
+            }.joined(separator: "\n")
         }
     }
 
-    /// 🚀 STEP 3: FIXED MAX_TOKENS AND TOKEN BUDGETING
     private func generateForChunk(
-        container: ModelContainer, activePrompt: String, chunkText: String,
-        chunkLabel: String?, thinkingEnabled: Bool
+        container: ModelContainer,
+        activePrompt: String,
+        chunkText: String,
+        chunkLabel: String?,
+        thinkingEnabled: Bool,
+        streamState: GenerationStreamState, // 👈 Passed shared run-state [2]
+        onToken: @MainActor @escaping (String) -> Void
     ) async throws -> ChunkResult {
 
         let userContent = chunkLabel != nil
@@ -798,17 +969,17 @@ class LLMManager: ObservableObject {
                     prompt: .chat(chatMessages),
                     additionalContext: [
                         "enable_thinking": thinkingEnabled,
-                        "thinking_budget": 128
+                        "thinking_budget": 192,
+                        "max_thinking_tokens": 192
                     ]
                 )
             )
 
-            var generateParameters = GenerateParameters(temperature: 0.0)
+            var generateParameters = GenerateParameters(temperature: 0.1)
             generateParameters.topP = 0.95
             generateParameters.repetitionPenalty = 1.15
-            // ⚡ Increased from 700 to 2048: Fixes the truncation bug in Batch 5
-            generateParameters.maxTokens = 2048
-            
+            generateParameters.maxTokens = 1024
+
             let stream = try MLXLMCommon.generate(
                 input: input,
                 parameters: generateParameters,
@@ -829,12 +1000,86 @@ class LLMManager: ObservableObject {
             var fullText = ""
             var thinkingText = ""
             var metrics = ChunkMetrics()
+            
+            //  STREAM BUFFER VARIABLES (Safely suppresses NONE / Placeholder headers during active typing)
+            var streamBuffer = ""
+            var isBufferDumped = false
+            
+            // GOOGLE AI STUDIO THINKING DESIGN: Shows live thinking updates on the screen in real-time [2]
+            var hasStreamedThinkingHeader = false
+            var hasStreamedResponseHeader = false
+            
+            // ⚡ MODEL HEADER SUPPRESSION BUFFER
+            var thinkingPrefixBuffer = ""
+
+            func handleIncomingToken(_ t: String) {
+                fullText += t
+                
+                if !isBufferDumped {
+                    streamBuffer += t
+                    let trimmedBuffer = streamBuffer.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+                    
+                    if trimmedBuffer.isEmpty {
+                        return // Whitespace buffering, let it aggregate
+                    }
+                    
+                    // Filter matching prefixes for dynamic typewriter suppression
+                    let nonePrefix = "NONE".hasPrefix(trimmedBuffer)
+                    let noLegalPrefix = "NO LEGAL CASES FOUND IN THIS DOCUMENT.".hasPrefix(trimmedBuffer)
+                    let noCitedPrefix = "NO CITED CASES FOUND IN THIS DOCUMENT.".hasPrefix(trimmedBuffer)
+                    
+                    if nonePrefix || noLegalPrefix || noCitedPrefix {
+                        return // Matches placeholder prefix, continue holding back stream
+                    } else {
+                        isBufferDumped = true
+                        let bufferToDump = streamBuffer
+                        Task { @MainActor in
+                            if !streamState.hasStreamedResponseHeader {
+                                streamState.hasStreamedResponseHeader = true
+                                onToken("\n\n📋 Extracted Citations:\n")
+                            }
+                            onToken(bufferToDump)
+                        }
+                    }
+                } else {
+                    Task { @MainActor in
+                        if !streamState.hasStreamedResponseHeader {
+                            streamState.hasStreamedResponseHeader = true
+                            onToken("\n\n📋 Extracted Citations:\n")
+                        }
+                        onToken(t)
+                    }
+                }
+            }
 
             func route(_ segments: [ReasoningEventEmitter.Segment]) {
                 for segment in segments {
                     switch segment {
-                    case .reasoning(let t): thinkingText += t
-                    case .response(let t): fullText += t
+                    case .reasoning(let t):
+                        thinkingText += t
+                        Task { @MainActor in
+                            if !streamState.hasStreamedThinkingHeader {
+                                streamState.hasStreamedThinkingHeader = true
+                                onToken("\n Thinking Process:\n")
+                            }
+                            
+                            //  Hides redundant "Thinking Process:" generated by Gemma 4 inside thought block [2]
+                            if thinkingText.count < 100 {
+                                thinkingPrefixBuffer += t
+                                let normalized = thinkingPrefixBuffer.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+                                if "thinking process:".hasPrefix(normalized) || "thinking:".hasPrefix(normalized) || "thinking process: thinking process:".hasPrefix(normalized) {
+                                    return
+                                } else {
+                                    let toStream = thinkingPrefixBuffer
+                                    thinkingPrefixBuffer = ""
+                                    onToken(toStream)
+                                }
+                            } else {
+                                onToken(t)
+                            }
+                        }
+                    case .response(let t):
+                        handleIncomingToken(t)
                     }
                 }
             }
@@ -845,7 +1090,7 @@ class LLMManager: ObservableObject {
                     if emitter != nil {
                         route(emitter!.process(text))
                     } else {
-                        fullText += text
+                        handleIncomingToken(text)
                     }
 
                 case .info(let info):

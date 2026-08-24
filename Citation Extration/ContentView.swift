@@ -30,7 +30,7 @@ struct ContentView: View {
     @State private var lastGeneratedFormat: OutputFormat? = nil
    
 
-    // 🌟 NEW: State variable for General Chat Question
+    //  NEW: State variable for General Chat Question
     @State private var userQuestion: String = ""
     
     var body: some View {
@@ -75,7 +75,7 @@ struct ContentView: View {
                 
                 // Top Bar: Model + Output Format + Thinking Selection
                 HStack {
-                    // ⏱️ NEW: Display Generation Time
+                    //  NEW: Display Generation Time
                     if !llmManager.generationTimeText.isEmpty {
                         Text(llmManager.generationTimeText)
                             .font(.caption)
@@ -160,7 +160,7 @@ struct ContentView: View {
                             Text("No cited cases found in this document.")
                                 .foregroundColor(.secondary).padding()
                         } else {
-                            // 🌟 General Chat Answer will be displayed here!
+                            // General Chat Answer / Streaming Text will be displayed here!
                             Text(currentOutput)
                                 .padding()
                                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -268,7 +268,7 @@ struct ContentView: View {
         userQuestion = ""
     }
 
-    // 🌟 NEW: Action for General Chat
+    //  NEW: Action for General Chat
  /*===   private func askGeneralQuestionAction() {
         guard !userQuestion.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         let question = userQuestion
@@ -301,9 +301,24 @@ struct ContentView: View {
         guard let text = activePDFText, !currentOutput.isEmpty else { return }
 
         errorMessage = nil
+        self.currentOutput = "" //  NEW: Clear the canvas so streaming writes on an empty screen
+        
         Task {
             do {
-                let output = try await llmManager.generateStructuredOutput(pdfText: text, model: selectedModel, outputFormat: newFormat, thinkingEnabled: thinkingEnabled, preFilterEnabled: preFilterEnabled)
+                // [OLD CODE]
+                // let output = try await llmManager.generateStructuredOutput(pdfText: text, model: selectedModel, outputFormat: newFormat, thinkingEnabled: thinkingEnabled, preFilterEnabled: preFilterEnabled)
+                
+                // [NEW CODE] Appends live tokens as they are produced in real-time
+                let output = try await llmManager.generateStructuredOutput(
+                    pdfText: text,
+                    model: selectedModel,
+                    outputFormat: newFormat,
+                    thinkingEnabled: thinkingEnabled,
+                    preFilterEnabled: preFilterEnabled
+                ) { token in
+                    self.currentOutput += token // Append tokens dynamically to the UI view
+                }
+                
                 if output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     self.errorMessage = "Model returned empty output."
                     return
@@ -341,10 +356,23 @@ struct ContentView: View {
     private func extractCitations() {
         guard let text = uploadedPDFText else { return }
         errorMessage = nil
+        self.currentOutput = "" //  NEW: Clear the canvas so streaming writes on an empty screen
 
         Task {
             do {
-                let output = try await llmManager.generateStructuredOutput(pdfText: text, model: selectedModel, outputFormat: selectedOutputFormat, thinkingEnabled: thinkingEnabled, preFilterEnabled: preFilterEnabled)
+                // [OLD CODE]
+                // let output = try await llmManager.generateStructuredOutput(pdfText: text, model: selectedModel, outputFormat: selectedOutputFormat, thinkingEnabled: thinkingEnabled, preFilterEnabled: preFilterEnabled)
+
+                // [NEW CODE] Appends live tokens as they are produced in real-time
+                let output = try await llmManager.generateStructuredOutput(
+                    pdfText: text,
+                    model: selectedModel,
+                    outputFormat: selectedOutputFormat,
+                    thinkingEnabled: thinkingEnabled,
+                    preFilterEnabled: preFilterEnabled
+                ) { token in
+                    self.currentOutput += token // 👈 Append tokens dynamically to the UI view
+                }
 
                 if output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     self.errorMessage = "Model returned empty output."

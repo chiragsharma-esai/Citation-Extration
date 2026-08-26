@@ -29,8 +29,11 @@ struct ContentView: View {
     @State private var activePDFText: String? = nil
     @State private var lastGeneratedFormat: OutputFormat? = nil
    
+    // Dropdown controls & Thinking State properties
+    @State private var currentThinking: String = ""
+    @State private var isThinkingExpanded: Bool = true
 
-    //  NEW: State variable for General Chat Question
+    //NEW: State variable for General Chat Question
     @State private var userQuestion: String = ""
     
     var body: some View {
@@ -59,14 +62,25 @@ struct ContentView: View {
                 .padding(8)
             }
             .navigationTitle("Chats")
-            .onChange(of: selectedHistory) { _, newValue in
-                guard let newValue else { return }
+            .onChange(of: selectedHistory) {  oldValue, newValue in
+                guard let newValue = newValue else { return }
                 currentOutput = newValue.extractedOutput
+                currentThinking = newValue.thinkingText
                 activePDFText = newValue.pdfText
                 lastGeneratedFormat = newValue.outputFormat
                 selectedOutputFormat = newValue.outputFormat
+                thinkingEnabled = newValue.thinkingEnabled
                 uploadedPDFText = nil
                 errorMessage = nil
+               // 1. Restore Model & Thinking State
+                selectedModel = newValue.model
+                thinkingEnabled = newValue.thinkingEnabled
+                selectedModel = newValue.model
+                thinkingEnabled = newValue.thinkingEnabled
+                //  2. RESTORE TIME AND TOKENS/SEC HERE
+                llmManager.generationTimeText = newValue.generationTimeText
+                                uploadedPDFText = nil
+                                errorMessage = nil
             }
 
         } detail: {
@@ -75,8 +89,18 @@ struct ContentView: View {
                 
                 // Top Bar: Model + Output Format + Thinking Selection
                 HStack {
-                    //  NEW: Display Generation Time
-                    if !llmManager.generationTimeText.isEmpty {
+                    // Real-time Status Text shown in the Top Bar during processing
+                    if llmManager.isGenerating {
+                        HStack(spacing: 8) {
+                            ProgressView()
+                                .scaleEffect(0.6)
+                                .frame(width: 16, height: 16)
+                            Text(llmManager.statusText)
+                                .font(.caption)
+                                .foregroundColor(.blue)
+                                .bold()
+                        }
+                    } else if !llmManager.generationTimeText.isEmpty {
                         Text(llmManager.generationTimeText)
                             .font(.caption)
                             .foregroundColor(.green)
@@ -131,62 +155,157 @@ struct ContentView: View {
                 Spacer()
                 
                 // MARK: - Output Area
-                if !currentOutput.isEmpty {
+                if !currentOutput.isEmpty || !currentThinking.isEmpty {
                     let parsedResult = DocumentExtractionResult.parse(from: currentOutput)
 
                     ScrollView {
-                        if let parsedResult, !parsedResult.citedCases.isEmpty {
-                            // Structured JSON parsed successfully
-                            VStack(alignment: .leading, spacing: 12) {
-                                ForEach(parsedResult.citedCases) { citedCase in
-                                    VStack(alignment: .leading, spacing: 4) {
-                                        Text(citedCase.caseName).font(.headline)
-                                        if let citation = citedCase.citation { Text(citation).font(.subheadline).foregroundColor(.secondary) }
-                                        HStack(spacing: 12) {
-                                            if let year = citedCase.year { Text("Year: \(String(year))") }
-                                            if let court = citedCase.court { Text("Court: \(court)") }
+                        VStack(alignment: .leading, spacing: 16) {
+                            
+                            // COLLAPSIBLE THOUGHTS CARD (Only rendered if Thinking is turned ON and has content)
+                            if thinkingEnabled && !currentThinking.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                VStack(alignment: .leading, spacing: 12) {
+                                    // Header Button
+                                    Button(action: {
+                                        withAnimation(.easeInOut(duration: 0.2)) {
+                                            isThinkingExpanded.toggle()
                                         }
-                                        .font(.caption).foregroundColor(.secondary)
-                                        if let context = citedCase.context { Text(context).font(.body).padding(.top, 2) }
+                                    }) {
+                                        HStack(spacing: 8) {
+                                            Image(systemName: "sparkles")
+                                                .foregroundColor(Color(nsColor: .systemBlue))
+                                                .font(.headline)
+                                            
+                                            Text("Thoughts")
+                                                .font(.headline)
+                                                .foregroundColor(.primary)
+                                            
+                                            Spacer()
+                                            
+                                            Image(systemName: isThinkingExpanded ? "chevron.up" : "chevron.down")
+                                                .foregroundColor(.secondary)
+                                                .font(.body)
+                                        }
                                     }
-                                    .padding()
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .background(Color(NSColor.textBackgroundColor))
-                                    .cornerRadius(10)
+                                    .buttonStyle(.plain)
+                                    
+                                    // Collapsible Content
+                                    if isThinkingExpanded {
+                                        VStack(alignment: .leading, spacing: 12) {
+                                            Divider()
+                                                .background(Color.secondary.opacity(0.15))
+                                            
+                                            // Dynamic markdown rendering (supports bold headers out-of-the-box)
+                                            Text(currentThinking)
+                                                .font(.body)
+                                                .foregroundColor(.secondary)
+                                                .lineSpacing(4)
+                                                .frame(maxWidth: .infinity, alignment: .leading)
+                                            
+                                            Divider()
+                                                .background(Color.secondary.opacity(0.15))
+                                            
+                                            // Collapse prompt at the bottom
+                                            Button(action: {
+                                                withAnimation(.easeInOut(duration: 0.2)) {
+                                                    isThinkingExpanded = false
+                                                }
+                                            }){
+                                                HStack {
+                                                    Text("Collapse to hide model thoughts")
+                                                        .font(.subheadline)
+                                                        .foregroundColor(.secondary)
+                                                    Spacer()
+                                                    Image(systemName: "chevron.up")
+                                                        .font(.caption)
+                                                        .foregroundColor(.secondary)
+                                                }
+                                            }
+                                            .buttonStyle(.plain)
+                                        }
+                                    }
+                                }
+                                .padding()
+                                .background(
+                                    RoundedRectangle(cornerRadius: 12)
+                                        .fill(Color(nsColor: .windowBackgroundColor))
+                                        .overlay(
+                                            RoundedRectangle(cornerRadius: 12)
+                                                .stroke(Color.secondary.opacity(0.15), lineWidth: 1)
+                                        )
+                                )
+                            }
+                            
+                            // EXECUTION TIME DISPLAY (Only appears when output is ready)
+                            if !llmManager.generationTimeText.isEmpty && !currentOutput.isEmpty {
+                                let timeString = llmManager.generationTimeText
+                                    .replacingOccurrences(of: "Time taken: ", with: "")
+                                    .replacingOccurrences(of: " seconds", with: "s")
+                                    .components(separatedBy: " ").first ?? ""
+                                
+                                Text(timeString)
+                                    .font(.system(.subheadline, design: .monospaced))
+                                    .foregroundColor(.secondary)
+                                    .padding(.top, 4)
+                            }
+                            
+                            // 📋 Response Output (Kept hidden until generation is completely finished)
+                            if !currentOutput.isEmpty {
+                                if let parsedResult, !parsedResult.citedCases.isEmpty {
+                                    // Structured JSON parsed successfully
+                                    VStack(alignment: .leading, spacing: 12) {
+                                        ForEach(parsedResult.citedCases) { citedCase in
+                                            VStack(alignment: .leading, spacing: 4) {
+                                                Text(citedCase.caseName).font(.headline)
+                                                if let citation = citedCase.citation { Text(citation).font(.subheadline).foregroundColor(.secondary) }
+                                                HStack(spacing: 12) {
+                                                    if let year = citedCase.year { Text("Year: \(String(year))") }
+                                                    if let court = citedCase.court { Text("Court: \(court)") }
+                                                }
+                                                .font(.caption).foregroundColor(.secondary)
+                                                if let context = citedCase.context { Text(context).font(.body).padding(.top, 2) }
+                                            }
+                                            .padding()
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                            .background(Color(NSColor.textBackgroundColor))
+                                            .cornerRadius(10)
+                                        }
+                                    }
+                                } else if parsedResult != nil {
+                                    Text("No cited cases found in this document.")
+                                        .foregroundColor(.secondary).padding()
+                                } else {
+                                    // General Chat Answer / Text Output
+                                    Text(currentOutput)
+                                        .padding()
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                        .background(Color(NSColor.textBackgroundColor))
+                                        .cornerRadius(10)
                                 }
                             }
-                            .padding()
-                        } else if parsedResult != nil {
-                            Text("No cited cases found in this document.")
-                                .foregroundColor(.secondary).padding()
-                        } else {
-                            // General Chat Answer / Streaming Text will be displayed here!
-                            Text(currentOutput)
-                                .padding()
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .background(Color(NSColor.textBackgroundColor))
-                                .cornerRadius(10)
                         }
+                        .padding()
                     }
                     .padding(.horizontal)
                     
                     // Export Buttons
-                    HStack {
-                        Spacer()
-                        Button(action: { ExportManager.saveAsCSV(citedCases: parsedResult?.citedCases, rawContent: currentOutput) }) {
-                            Label("Save in Excel", systemImage: "tablecells")
+                    if !currentOutput.isEmpty {
+                        HStack {
+                            Spacer()
+                            Button(action: { ExportManager.saveAsCSV(citedCases: parsedResult?.citedCases, rawContent: currentOutput) }) {
+                                Label("Save in Excel", systemImage: "tablecells")
+                            }
+                            Button(action: { ExportManager.saveAsPDF(citedCases: parsedResult?.citedCases, rawContent: currentOutput) }) {
+                                Label("Save in PDF", systemImage: "doc.text")
+                            }
                         }
-                        Button(action: { ExportManager.saveAsPDF(citedCases: parsedResult?.citedCases, rawContent: currentOutput) }) {
-                            Label("Save in PDF", systemImage: "doc.text")
-                        }
+                        .padding(.horizontal)
                     }
-                    .padding(.horizontal)
                 }
                 
                 Spacer()
                 
-                // MARK: - Upload & Extract Area OR General Chat
-                if currentOutput.isEmpty {
+                // MARK: - Upload Area (Only shown when starting a brand new extraction)
+                if currentOutput.isEmpty && currentThinking.isEmpty && !llmManager.isGenerating {
                     VStack(spacing: 20) {
                         
                         // --- OPTION 1: PDF UPLOAD ---
@@ -198,7 +317,7 @@ struct ContentView: View {
                                 }
                                 .frame(maxWidth: .infinity)
                                 .padding(40)
-                                .background(RoundedRectangle(cornerRadius: 12).stroke(style: StrokeStyle(lineWidth: 2, dash: [5])).foregroundColor(.gray))
+                                  .background(RoundedRectangle(cornerRadius: 12).stroke(style: StrokeStyle(lineWidth: 2, dash: [5])).foregroundColor(.gray))
                             }
                             .buttonStyle(.plain)
                         } else {
@@ -209,33 +328,7 @@ struct ContentView: View {
                             .buttonStyle(.borderedProminent).controlSize(.large).disabled(llmManager.isGenerating)
                         }
                         
-                        // --- DIVIDER ---
-                     /*===   if uploadedPDFText == nil {
-                            HStack {
-                                VStack { Divider() }
-                                Text("OR ASK A QUESTION").font(.caption).foregroundColor(.secondary)
-                                VStack { Divider() }
-                            }
-                            .padding(.vertical, 10)
-                            
-                            // --- OPTION 2: GENERAL CHAT ---
-                            HStack {
-                                TextField("E.g., What is photosynthesis?", text: $userQuestion)
-                                    .textFieldStyle(.roundedBorder)
-                                    .disabled(llmManager.isGenerating)
-                                    .onSubmit { askGeneralQuestionAction() }
-                                
-                                Button(action: askGeneralQuestionAction) {
-                                    if llmManager.isGenerating {
-                                        ProgressView().scaleEffect(0.7)
-                                    } else {
-                                        Text("Ask AI")
-                                    }
-                                }
-                                .buttonStyle(.borderedProminent)
-                                .disabled(userQuestion.isEmpty || llmManager.isGenerating)
-                            }
-                        }===*/
+                       
 
                         // Status & Errors
                         if llmManager.isGenerating && !llmManager.statusText.isEmpty {
@@ -262,72 +355,54 @@ struct ContentView: View {
         uploadedPDFText = nil
         uploadedFileName = nil
         currentOutput = ""
+        currentThinking = ""
+        isThinkingExpanded = true
         errorMessage = nil
         activePDFText = nil
         lastGeneratedFormat = nil
         userQuestion = ""
     }
-
-    //  NEW: Action for General Chat
- /*===   private func askGeneralQuestionAction() {
-        guard !userQuestion.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        let question = userQuestion
-        errorMessage = nil
-        
-        Task {
-            do {
-                // Calls the new function in LLMManager
-                let output = try await llmManager.askGeneralQuestion(question: question, model: selectedModel)
-                
-                self.currentOutput = output
-                self.activePDFText = nil // No PDF for this chat
-                self.lastGeneratedFormat = .text
-                
-                // Save to History
-                let newHistory = ChatHistory(title: question, pdfText: "", extractedOutput: output, outputFormat: .text)
-                self.histories.insert(newHistory, at: 0)
-                self.selectedHistory = newHistory
-                
-                self.userQuestion = "" // Clear text field
-            } catch {
-                self.errorMessage = "Error: \(error.localizedDescription)"
-            }
-        }
-    }
-==========================*/
-
     private func regenerateIfFormatChanged(to newFormat: OutputFormat) {
         guard newFormat != lastGeneratedFormat else { return }
         guard let text = activePDFText, !currentOutput.isEmpty else { return }
 
         errorMessage = nil
-        self.currentOutput = "" //  NEW: Clear the canvas so streaming writes on an empty screen
-        
         Task {
             do {
-                // [OLD CODE]
-                // let output = try await llmManager.generateStructuredOutput(pdfText: text, model: selectedModel, outputFormat: newFormat, thinkingEnabled: thinkingEnabled, preFilterEnabled: preFilterEnabled)
+                self.currentOutput = ""
+                self.currentThinking = ""
+                self.isThinkingExpanded = true
                 
-                // [NEW CODE] Appends live tokens as they are produced in real-time
-                let output = try await llmManager.generateStructuredOutput(
+                var tempOutput = ""
+                
+                let result = try await llmManager.generateStructuredOutput(
                     pdfText: text,
                     model: selectedModel,
                     outputFormat: newFormat,
                     thinkingEnabled: thinkingEnabled,
-                    preFilterEnabled: preFilterEnabled
-                ) { token in
-                    self.currentOutput += token // Append tokens dynamically to the UI view
-                }
+                    preFilterEnabled: preFilterEnabled,
+                    onThinkingToken: { token in
+                        self.currentThinking += token
+                    },
+                    onToken: { token in
+                        tempOutput += token
+                    }
+                )
                 
-                if output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                if result.responseText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     self.errorMessage = "Model returned empty output."
                     return
                 }
-                self.currentOutput = output
+                
+                // Update UI once after completion
+                self.currentThinking = result.thinkingText
+                self.currentOutput = result.responseText
                 self.lastGeneratedFormat = newFormat
 
                 if let selectedHistory, let index = histories.firstIndex(where: { $0.id == selectedHistory.id }) {
-                    histories[index].extractedOutput = output
+                    histories[index].extractedOutput = result.responseText
+                    histories[index].thinkingText = result.thinkingText
+                    histories[index].thinkingEnabled = thinkingEnabled // 🌟 Preserve toggle state
                     histories[index].outputFormat = newFormat
                     self.selectedHistory = histories[index]
                 }
@@ -356,35 +431,51 @@ struct ContentView: View {
     private func extractCitations() {
         guard let text = uploadedPDFText else { return }
         errorMessage = nil
-        self.currentOutput = "" //  NEW: Clear the canvas so streaming writes on an empty screen
 
         Task {
             do {
-                // [OLD CODE]
-                // let output = try await llmManager.generateStructuredOutput(pdfText: text, model: selectedModel, outputFormat: selectedOutputFormat, thinkingEnabled: thinkingEnabled, preFilterEnabled: preFilterEnabled)
-
-                // [NEW CODE] Appends live tokens as they are produced in real-time
-                let output = try await llmManager.generateStructuredOutput(
+                self.currentOutput = ""
+                self.currentThinking = ""
+                self.isThinkingExpanded = true
+                
+                var tempOutput = ""
+                
+                let result = try await llmManager.generateStructuredOutput(
                     pdfText: text,
                     model: selectedModel,
                     outputFormat: selectedOutputFormat,
                     thinkingEnabled: thinkingEnabled,
-                    preFilterEnabled: preFilterEnabled
-                ) { token in
-                    self.currentOutput += token // 👈 Append tokens dynamically to the UI view
-                }
+                    preFilterEnabled: preFilterEnabled,
+                    onThinkingToken: { token in
+                        self.currentThinking += token
+                    },
+                    onToken: { token in
+                        tempOutput += token
+                    }
+                )
 
-                if output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                if result.responseText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     self.errorMessage = "Model returned empty output."
                     return
                 }
 
-                self.currentOutput = output
+                // Update UI once after completion
+                self.currentThinking = result.thinkingText
+                self.currentOutput = result.responseText
                 self.activePDFText = text
                 self.lastGeneratedFormat = selectedOutputFormat
+                self.isThinkingExpanded = true
 
                 let title = uploadedFileName ?? "Untitled Extraction"
-                let newHistory = ChatHistory(title: title, pdfText: text, extractedOutput: output, outputFormat: selectedOutputFormat,  generationTimeText: llmManager.generationTimeText
+                let newHistory = ChatHistory(
+                    title: title,
+                    pdfText: text,
+                    extractedOutput: result.responseText,
+                    outputFormat: selectedOutputFormat,
+                    generationTimeText: llmManager.generationTimeText,
+                    thinkingText: result.thinkingText,
+                    thinkingEnabled: thinkingEnabled,
+                    model: selectedModel
                 )
                 self.histories.insert(newHistory, at: 0)
                 self.selectedHistory = newHistory

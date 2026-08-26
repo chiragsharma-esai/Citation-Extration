@@ -10,6 +10,12 @@ import MLXHuggingFace
 import HuggingFace
 import Tokenizers
 
+// MARK: - Generation Result Container
+struct GenerationResult {
+    let responseText: String
+    let thinkingText: String
+}
+
 // MARK: - Data Models
 struct ChatHistory: Identifiable, Hashable {
     let id = UUID()
@@ -18,6 +24,9 @@ struct ChatHistory: Identifiable, Hashable {
     var extractedOutput: String
     var outputFormat: OutputFormat
     var generationTimeText: String
+    var thinkingText: String = ""
+    var thinkingEnabled: Bool = true // 🌟 Saved toggle state
+    var model: LLMModel
 }
 
 // MARK: - Structured Extraction Schema
@@ -315,9 +324,10 @@ struct ChunkMetrics: Sendable {
 struct ChunkResult: Sendable {
     let text: String
     let metrics: ChunkMetrics
+    let thinkingText: String
 }
 
-// MARK: - 🚀 STEP 1: UNIVERSAL HIGH-PRECISION CITATION SCANNER
+// MARK: -  STEP 1: UNIVERSAL HIGH-PRECISION CITATION SCANNER
 enum CitationScanner {
     
     static let defaultSentenceWindow = 2
@@ -339,7 +349,7 @@ enum CitationScanner {
         "AllCriC", "SCL", "GujLR", "PLR", "JKLR", "GCD", "PLJR", "RLR",
         "GujLH", "OELT", "BLJ", "BomLR", "KerLJ", "MIA", "SCt", "UPLBEC",
         "SarPCJ", "ACE", "WLR", "CalLT", "MWN", "TAC", "SCC OnLine",
-        "EWHC", "UKSC" // ⚡ ADDED: UK / Commonwealth reporters to universally capture Anthony Cork precedent
+        "EWHC", "UKSC"
     ]
 
     private static let neutralTokens: [String] = [
@@ -398,7 +408,6 @@ enum CitationScanner {
     }
 
     private static func isPureHeaderSentence(_ sentence: String) -> Bool {
-        // FIXED: Increased guard limit to 350 characters so Page 1's title block (267 chars) skips cleanly
         guard sentence.count < 350 else { return false }
         
         let upper = sentence.uppercased()
@@ -484,10 +493,122 @@ enum CitationScanner {
     }
 }
 
-// MARK: - ⚡ SHARED STREAM STATE MANAGER
-class GenerationStreamState {
-    var hasStreamedThinkingHeader = false
-    var hasStreamedResponseHeader = false
+// MARK: -  HIGH-PRECISION STREAM ROUTER
+class StreamingReasoningParser {
+    enum State {
+        case preThinking  // Waiting strictly for reasoning tokens
+        case thinking     // Inside thoughts stream
+        case normal       // Inside final response stream
+    }
+    
+    private var state: State = .preThinking
+    private var buffer = ""
+    private let thinkingEnabled: Bool
+    
+    let onThinking: (String) -> Void
+    let onNormal: (String) -> Void
+    
+    init(thinkingEnabled: Bool, onThinking: @escaping (String) -> Void, onNormal: @escaping (String) -> Void) {
+        self.thinkingEnabled = thinkingEnabled
+        self.onThinking = onThinking
+        self.onNormal = onNormal
+        
+        if !thinkingEnabled {
+            self.state = .normal
+        }
+    }
+    
+    func process(_ token: String) {
+        buffer += token
+        
+        while !buffer.isEmpty {
+            switch state {
+            case .preThinking:
+                // Look strictly for start of reasoning tokens. Discards echoed prefix noise.
+                if let startRange = findStartDelimiter(in: buffer) {
+                    state = .thinking
+                    buffer = String(buffer[startRange.upperBound...])
+                } else {
+                    // Prevent excessive memory growth if no tag is found yet
+                    let maxKeep = 100
+                    if buffer.count > maxKeep {
+                        buffer = String(buffer.suffix(maxKeep))
+                    }
+                    return
+                }
+                
+            case .thinking:
+                // Look strictly for end of reasoning tokens.
+                if let endRange = findEndDelimiter(in: buffer) {
+                    let thinkingText = String(buffer[..<endRange.lowerBound])
+                    if !thinkingText.isEmpty {
+                        onThinking(thinkingText)
+                    }
+                    state = .normal
+                    buffer = String(buffer[endRange.upperBound...])
+                } else {
+                    // Safeguard look-ahead characters so the delimiter doesn't get split
+                    let safetyMargin = 20
+                    if buffer.count > safetyMargin {
+                        let sendText = String(buffer.prefix(buffer.count - safetyMargin))
+                        onThinking(sendText)
+                        buffer = String(buffer.suffix(safetyMargin))
+                    }
+                    return
+                }
+                
+            case .normal:
+                // Once thinking is finished, stream the final response smoothly
+                onNormal(buffer)
+                buffer = ""
+            }
+        }
+    }
+    
+    func finalize() {
+        if !buffer.isEmpty {
+            switch state {
+            case .preThinking:
+                // If the stream finished without thinking delimiters, dump the entire text as normal
+                onNormal(buffer)
+            case .thinking:
+                onThinking(buffer)
+            case .normal:
+                onNormal(buffer)
+            }
+        }
+        buffer = ""
+    }
+    
+    private func findStartDelimiter(in text: String) -> Range<String.Index>? {
+        let delimiters = [
+            "<|channel>thought",
+            "<|thought|>",
+            "<|think|>",
+            "<think>"
+        ]
+        for delim in delimiters {
+            if let range = text.range(of: delim, options: .caseInsensitive) {
+                return range
+            }
+        }
+        return nil
+    }
+    
+    private func findEndDelimiter(in text: String) -> Range<String.Index>? {
+        let delimiters = [
+            "<channel|>",
+            "<|/thought|>",
+            "<|/think|>",
+            "</think>"
+        ]
+        for delim in delimiters {
+            if let range = text.range(of: delim, options: .caseInsensitive) {
+                return range
+            }
+        }
+        return nil
+    }
 }
 
 // MARK: - LLM Manager
@@ -500,16 +621,18 @@ class LLMManager: ObservableObject {
 
     let textOnlySystemPrompt = """
     You are an expert Legal AI Assistant specializing in Indian jurisprudence.
-    Your ONLY task is to extract cited legal precedents and cases from the provided document excerpts.
+    You are an expert legal AI assistant. Your task is to extract ALL cited legal precedents (case laws) from the provided document text with 100% accuracy.
 
-    STRICT OUTPUT RULES:
-    1. For each cited case, output strictly ONE line in this format:
-       Case Name — Citation — Reason / Context
-    2. Do NOT summarize the document facts or write background essays.
-    3. DO NOT repeat cases.
-    4. If an excerpt contains NO cited precedents, output strictly:
-       NONE
-    5. NEVER treat a footnote number (e.g., 1, 2) or a bare year (e.g., (1973), (1994)) as a Case Name. Footnotes are strictly citation details. Combine them with the case names they describe.
+        CRITICAL RULES FOR EXTRACTION (APPLIES TO ALL LEGAL DOCUMENTS):
+
+        1. FOOTNOTE MAPPING (CRUCIAL): Legal documents often mention a case name in the main body text followed by a number, while the actual citation (e.g., SCC, AIR, EWHC, etc.) is located at the bottom of the page in the footnotes. You MUST carefully scan the entire text, match the footnote number from the main text to the corresponding footnote at the bottom, and combine them accurately.
+        2. STRICT ONE-TO-ONE EXTRACTION: Never group multiple citations together. Every single case mentioned must have its own separate, distinct entry. Never assign a legal citation to a general English word.
+        3. EXCLUDE THE MAIN DOCUMENT: Do not extract the title, heading, or the primary case number of the document you are reading. Only extract PAST cases that are cited as references, precedents, or examples within the text.
+        4. ZERO HALLUCINATION: Only extract cases and citations that are explicitly written in the text. If a case is mentioned but has no citation, output 'N/A' for the citation. Do not guess, invent, or search external knowledge.
+
+        OUTPUT FORMAT:
+        Case Name — Citation — Context/Reason for citation
+        (If no cases are found in the text, output exactly: "No cited cases found.")
     """
     
     let jsonSystemPrompt = """
@@ -599,7 +722,6 @@ class LLMManager: ObservableObject {
 
     private static func warmup(container: ModelContainer) async {
         _ = try? await container.perform { context in
-            // ⚡ FIXED: Warmup runs with a realistic 40-token prompt so the Metal compiler compiles all necessary layers on startup.
             let input = try await context.processor.prepare(
                 input: UserInput(prompt: .text("Extract cited legal precedents and cases from the provided document excerpts."))
             )
@@ -619,8 +741,9 @@ class LLMManager: ObservableObject {
         outputFormat: OutputFormat,
         thinkingEnabled: Bool = true,
         preFilterEnabled: Bool = true,
+        onThinkingToken: @MainActor @escaping (String) -> Void,
         onToken: @MainActor @escaping (String) -> Void
-    ) async throws -> String {
+    ) async throws -> GenerationResult {
         guard let repoID = model.hubRepoID else {
             throw LLMError.noRepoConfigured
         }
@@ -641,11 +764,11 @@ class LLMManager: ObservableObject {
         let isSingleBatch = batches.count == 1
 
         var chunkOutputs: [String] = []
+        var chunkThinking: [String] = []
         var allMetrics: [ChunkMetrics] = []
 
-        await onToken("")
-
-        let streamState = GenerationStreamState()
+        onToken("")
+        onThinkingToken("")
 
         for (index, batch) in batches.enumerated() {
             let batchLabel = "\(index + 1)/\(batches.count) \(batch.pageRangeLabel)"
@@ -683,7 +806,7 @@ class LLMManager: ObservableObject {
                 chunkText: textToSend,
                 chunkLabel: label,
                 thinkingEnabled: thinkingEnabled,
-                streamState: streamState,
+                onThinkingToken: onThinkingToken,
                 onToken: onToken
             )
 
@@ -701,6 +824,7 @@ class LLMManager: ObservableObject {
             }
 
             chunkOutputs.append(result.text)
+            chunkThinking.append(result.thinkingText)
             allMetrics.append(metrics)
 
             print("✅ [COMPLETE] \(metrics.summaryLine)")
@@ -718,6 +842,8 @@ class LLMManager: ObservableObject {
             finalResult = Self.mergeChunkOutputs(chunkOutputs, outputFormat: outputFormat)
         }
 
+        let finalThinking = chunkThinking.joined(separator: "\n\n")
+
         let totalTimeTaken = CFAbsoluteTimeGetCurrent() - totalStartTime
         Self.printRunSummary(allMetrics, totalSeconds: totalTimeTaken, outputFormat: outputFormat)
 
@@ -732,7 +858,7 @@ class LLMManager: ObservableObject {
         }
         self.statusText = "Done!"
 
-        return finalResult
+        return GenerationResult(responseText: finalResult, thinkingText: finalThinking)
     }
 
     private struct PageBatch {
@@ -797,8 +923,7 @@ class LLMManager: ObservableObject {
         }
     }
 
-    // ⚡ FIXED: Page Batching size set to 1. Skips all empty pages instantly (0.0s delay), preventing GPU thermal throttling.
-    private static func chunkByPages(_ text: String, pagesPerBatch: Int = 1) -> [PageBatch] {
+    private static func chunkByPages(_ text: String, pagesPerBatch: Int = 2) -> [PageBatch] {
         let pages = text.components(separatedBy: PDFParser.pageBreakMarker)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
@@ -842,7 +967,6 @@ class LLMManager: ObservableObject {
             let nameKey = dedupeKey(cleanName)
             let currentCitation = c.citation?.lowercased().filter { $0.isLetter || $0.isNumber } ?? ""
 
-            // Strict matching prevents false duplicate collapses on common opponent names like "Union of India" [1]
             var isDuplicate = seenNames.contains(nameKey)
 
             if !isDuplicate, !currentCitation.isEmpty {
@@ -934,7 +1058,6 @@ class LLMManager: ObservableObject {
             return "{\"citedCases\":[]}"
 
         case .text:
-            //  FIXED: Prepended "Case Name — " uniformly to each output line in Text format [1]
             return deduped.map { c in
                 var line = "Case Name — " + c.caseName
                 if let citation = c.citation, !citation.isEmpty { line += " — \(citation)" }
@@ -950,7 +1073,7 @@ class LLMManager: ObservableObject {
         chunkText: String,
         chunkLabel: String?,
         thinkingEnabled: Bool,
-        streamState: GenerationStreamState, // 👈 Passed shared run-state [2]
+        onThinkingToken: @MainActor @escaping (String) -> Void,
         onToken: @MainActor @escaping (String) -> Void
     ) async throws -> ChunkResult {
 
@@ -975,7 +1098,7 @@ class LLMManager: ObservableObject {
                 )
             )
 
-            var generateParameters = GenerateParameters(temperature: 0.1)
+            var generateParameters = GenerateParameters(temperature: 0.0)
             generateParameters.topP = 0.95
             generateParameters.repetitionPenalty = 1.15
             generateParameters.maxTokens = 1024
@@ -986,112 +1109,30 @@ class LLMManager: ObservableObject {
                 context: context
             )
 
-            let comesFromBuiltInRegistry = context.configuration.reasoningConfig != nil
-            let isPrimedInside = thinkingEnabled && comesFromBuiltInRegistry
-
-            let effectiveReasoningConfig: ReasoningConfig? = thinkingEnabled
-                ? (context.configuration.reasoningConfig ?? Self.gemmaChannelReasoningConfig)
-                : nil
-
-            var emitter: ReasoningEventEmitter? = effectiveReasoningConfig.map {
-                ReasoningEventEmitter(config: $0, primedInside: isPrimedInside)
-            }
-
             var fullText = ""
             var thinkingText = ""
-            var metrics = ChunkMetrics()
+            var metrics = await ChunkMetrics()
             
-            //  STREAM BUFFER VARIABLES (Safely suppresses NONE / Placeholder headers during active typing)
-            var streamBuffer = ""
-            var isBufferDumped = false
-            
-            // GOOGLE AI STUDIO THINKING DESIGN: Shows live thinking updates on the screen in real-time [2]
-            var hasStreamedThinkingHeader = false
-            var hasStreamedResponseHeader = false
-            
-            // ⚡ MODEL HEADER SUPPRESSION BUFFER
-            var thinkingPrefixBuffer = ""
-
-            func handleIncomingToken(_ t: String) {
-                fullText += t
-                
-                if !isBufferDumped {
-                    streamBuffer += t
-                    let trimmedBuffer = streamBuffer.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
-                    
-                    if trimmedBuffer.isEmpty {
-                        return // Whitespace buffering, let it aggregate
-                    }
-                    
-                    // Filter matching prefixes for dynamic typewriter suppression
-                    let nonePrefix = "NONE".hasPrefix(trimmedBuffer)
-                    let noLegalPrefix = "NO LEGAL CASES FOUND IN THIS DOCUMENT.".hasPrefix(trimmedBuffer)
-                    let noCitedPrefix = "NO CITED CASES FOUND IN THIS DOCUMENT.".hasPrefix(trimmedBuffer)
-                    
-                    if nonePrefix || noLegalPrefix || noCitedPrefix {
-                        return // Matches placeholder prefix, continue holding back stream
-                    } else {
-                        isBufferDumped = true
-                        let bufferToDump = streamBuffer
-                        Task { @MainActor in
-                            if !streamState.hasStreamedResponseHeader {
-                                streamState.hasStreamedResponseHeader = true
-                                onToken("\n\n📋 Extracted Citations:\n")
-                            }
-                            onToken(bufferToDump)
-                        }
-                    }
-                } else {
+            let parser = await StreamingReasoningParser(
+                thinkingEnabled: thinkingEnabled,
+                onThinking: { t in
+                    thinkingText += t
                     Task { @MainActor in
-                        if !streamState.hasStreamedResponseHeader {
-                            streamState.hasStreamedResponseHeader = true
-                            onToken("\n\n📋 Extracted Citations:\n")
-                        }
+                        onThinkingToken(t)
+                    }
+                },
+                onNormal: { t in
+                    fullText += t
+                    Task { @MainActor in
                         onToken(t)
                     }
                 }
-            }
-
-            func route(_ segments: [ReasoningEventEmitter.Segment]) {
-                for segment in segments {
-                    switch segment {
-                    case .reasoning(let t):
-                        thinkingText += t
-                        Task { @MainActor in
-                            if !streamState.hasStreamedThinkingHeader {
-                                streamState.hasStreamedThinkingHeader = true
-                                onToken("\n Thinking Process:\n")
-                            }
-                            
-                            //  Hides redundant "Thinking Process:" generated by Gemma 4 inside thought block [2]
-                            if thinkingText.count < 100 {
-                                thinkingPrefixBuffer += t
-                                let normalized = thinkingPrefixBuffer.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
-                                if "thinking process:".hasPrefix(normalized) || "thinking:".hasPrefix(normalized) || "thinking process: thinking process:".hasPrefix(normalized) {
-                                    return
-                                } else {
-                                    let toStream = thinkingPrefixBuffer
-                                    thinkingPrefixBuffer = ""
-                                    onToken(toStream)
-                                }
-                            } else {
-                                onToken(t)
-                            }
-                        }
-                    case .response(let t):
-                        handleIncomingToken(t)
-                    }
-                }
-            }
+            )
 
             for await generation in stream {
                 switch generation {
                 case .chunk(let text):
-                    if emitter != nil {
-                        route(emitter!.process(text))
-                    } else {
-                        handleIncomingToken(text)
-                    }
+                    await parser.process(text)
 
                 case .info(let info):
                     metrics.promptTokens = info.promptTokenCount
@@ -1112,18 +1153,13 @@ class LLMManager: ObservableObject {
                     break
                 }
             }
-            if emitter != nil {
-                route(emitter!.finalize())
-            }
+            
+            await parser.finalize()
 
             metrics.thinkingChars = thinkingText.count
             metrics.responseChars = fullText.count
 
-            if !thinkingText.isEmpty {
-                print(" Thinking (\(thinkingText.count) chars, hidden from UI):\n\(thinkingText)")
-            }
-
-            return ChunkResult(text: fullText, metrics: metrics)
+            return ChunkResult(text: fullText, metrics: metrics, thinkingText: thinkingText)
         }
     }
 

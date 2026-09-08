@@ -21,8 +21,8 @@ struct ChatHistory: Identifiable, Hashable {
     let id = UUID()
     var title: String
     var pdfText: String
+    var pdfURL: URL?
     var extractedOutput: String
-    var outputFormat: OutputFormat
     var generationTimeText: String
     var thinkingText: String = ""
     var thinkingEnabled: Bool = true
@@ -31,15 +31,16 @@ struct ChatHistory: Identifiable, Hashable {
 
 // MARK: - Structured Extraction Schema
 struct CitedCase: Codable, Identifiable, Hashable {
-    var id: String { caseName + (citation ?? "") + (year.map(String.init) ?? "") }
+    var id: String { caseName + (citation ?? "") + (year.map(String.init) ?? "") + (pageNumber.map(String.init) ?? "") }
     let caseName: String
     let citation: String?
     let year: Int?
     let court: String?
     let context: String?
+    let pageNumber: Int?
 
     private enum CodingKeys: String, CodingKey {
-        case caseName, citation, year, court, context
+        case caseName, citation, year, court, context, pageNumber
     }
 
     init(from decoder: Swift.Decoder) throws {
@@ -49,14 +50,16 @@ struct CitedCase: Codable, Identifiable, Hashable {
         court = Self.decodeLenientString(container, .court)
         context = Self.decodeLenientString(container, .context)
         year = Self.decodeLenientInt(container, .year)
+        pageNumber = Self.decodeLenientInt(container, .pageNumber)
     }
 
-    init(caseName: String, citation: String?, year: Int?, court: String?, context: String?) {
+    init(caseName: String, citation: String?, year: Int?, court: String?, context: String?, pageNumber: Int? = nil) {
         self.caseName = caseName
         self.citation = citation
         self.year = year
         self.court = court
         self.context = context
+        self.pageNumber = pageNumber
     }
 
     private static func decodeLenientString(_ container: KeyedDecodingContainer<CodingKeys>, _ key: CodingKeys) -> String? {
@@ -103,6 +106,38 @@ struct DocumentExtractionResult: Codable {
 
         guard let data = text.data(using: .utf8) else { return nil }
         return try? JSONDecoder().decode(DocumentExtractionResult.self, from: data)
+    }
+}
+
+struct DocumentSelfReference {
+    let caseTitle: String?
+    let caseNumber: String?
+
+    static func parse(from rawOutput: String) -> DocumentSelfReference {
+        var text = rawOutput.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if let fenceStart = text.range(of: "```json") {
+            text = String(text[fenceStart.upperBound...])
+        } else if let fenceStart = text.range(of: "```") {
+            text = String(text[fenceStart.upperBound...])
+        }
+        if let fenceEnd = text.range(of: "```") {
+            text = String(text[..<fenceEnd.lowerBound])
+        }
+
+        guard let firstBrace = text.firstIndex(of: "{"),
+              let lastBrace = text.lastIndex(of: "}"),
+              let data = String(text[firstBrace...lastBrace]).data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return DocumentSelfReference(caseTitle: nil, caseNumber: nil)
+        }
+
+        let title = (json["caseTitle"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let number = (json["caseNumber"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return DocumentSelfReference(
+            caseTitle: (title?.isEmpty ?? true) ? nil : title,
+            caseNumber: (number?.isEmpty ?? true) ? nil : number
+        )
     }
 }
 
@@ -246,11 +281,7 @@ private struct ManualTokenizerLoader: MLXLMCommon.TokenizerLoader {
     }
 }
 
-enum OutputFormat: String, CaseIterable, Identifiable {
-    case json = "JSON"
-    case text = "Text"
-    var id: String { rawValue }
-}
+// OutputFormat removed — always JSON internally
 
 enum ParseStatus: Sendable {
     case notApplicable
@@ -467,49 +498,94 @@ enum CitationScanner {
         return NSRange(location: start, length: max(0, end - start))
     }
 
+    struct AnnotatedPassage {
+        let text: String
+        let pageNumber: Int
+    }
+
+    private static func pageNumberAt(offset: Int, in text: NSString, pageMarkerPositions: [(offset: Int, page: Int)]) -> Int {
+        var bestPage = pageMarkerPositions.first?.page ?? 1
+        for (markerOffset, page) in pageMarkerPositions {
+            if markerOffset <= offset {
+                bestPage = page
+            } else {
+                break
+            }
+        }
+        return bestPage
+    }
+
+    private static func findPageMarkers(in text: NSString) -> [(offset: Int, page: Int)] {
+        let markerPrefix = LLMManager.internalPageMarker
+        let markerSuffix = LLMManager.internalPageMarkerSuffix
+        var markers: [(offset: Int, page: Int)] = []
+        var searchStart = 0
+        while searchStart < text.length {
+            let range = text.range(of: markerPrefix, options: [], range: NSRange(location: searchStart, length: text.length - searchStart))
+            guard range.location != NSNotFound else { break }
+            let afterPrefix = range.location + range.length
+            let suffixRange = text.range(of: markerSuffix, options: [], range: NSRange(location: afterPrefix, length: min(10, text.length - afterPrefix)))
+            if suffixRange.location != NSNotFound {
+                let pageStr = text.substring(with: NSRange(location: afterPrefix, length: suffixRange.location - afterPrefix))
+                if let pageNum = Int(pageStr) {
+                    markers.append((offset: range.location, page: pageNum))
+                }
+            }
+            searchStart = range.location + range.length
+        }
+        return markers
+    }
+
     static func candidatePassages(
         in text: String,
         charsBefore: Int = defaultCharsBefore,
         charsAfter: Int = defaultCharsAfter
-    ) -> String? {
+    ) -> [AnnotatedPassage]? {
         let ns = text as NSString
         let full = NSRange(location: 0, length: ns.length)
         let matches = citationRegex.matches(in: text, range: full)
         guard !matches.isEmpty else { return nil }
 
-        // 1. Expand character windows around each regex hit
-        var rawRanges: [NSRange] = []
+        let pageMarkers = findPageMarkers(in: ns)
+
+        // 1. Expand character windows around each regex hit, tracking page
+        var rawEntries: [(range: NSRange, page: Int)] = []
         for match in matches {
             let start = max(0, match.range.location - charsBefore)
             let end = min(ns.length, match.range.location + match.range.length + charsAfter)
-            rawRanges.append(NSRange(location: start, length: end - start))
+            let page = pageNumberAt(offset: match.range.location, in: ns, pageMarkerPositions: pageMarkers)
+            rawEntries.append((range: NSRange(location: start, length: end - start), page: page))
         }
 
         // 2. Merge overlapping / nearby character windows (within 60 characters)
-        let sortedRanges = rawRanges.sorted { $0.location < $1.location }
-        var mergedRanges: [NSRange] = []
-        for range in sortedRanges {
-            if let last = mergedRanges.last {
-                let lastEnd = last.location + last.length
-                if range.location <= lastEnd + 60 {
-                    mergedRanges[mergedRanges.count - 1].length = max(lastEnd, range.location + range.length) - last.location
+        let sorted = rawEntries.sorted { $0.range.location < $1.range.location }
+        var merged: [(range: NSRange, page: Int)] = []
+        for entry in sorted {
+            if let last = merged.last {
+                let lastEnd = last.range.location + last.range.length
+                if entry.range.location <= lastEnd + 60 {
+                    merged[merged.count - 1].range.length = max(lastEnd, entry.range.location + entry.range.length) - last.range.location
                 } else {
-                    mergedRanges.append(range)
+                    merged.append(entry)
                 }
             } else {
-                mergedRanges.append(range)
+                merged.append(entry)
             }
         }
 
         // 3. Snap to clean word boundaries and extract candidate text passages
-        var passages = mergedRanges.compactMap { range -> String? in
-            let snapped = snapToWordBoundaries(in: ns, range: range)
+        var passages: [AnnotatedPassage] = merged.compactMap { entry in
+            let snapped = snapToWordBoundaries(in: ns, range: entry.range)
             guard snapped.length > 0 else { return nil }
-            let passage = ns.substring(with: snapped).trimmingCharacters(in: .whitespacesAndNewlines)
-            if isPureHeaderPassage(passage) {
-                return nil
+            var passage = ns.substring(with: snapped).trimmingCharacters(in: .whitespacesAndNewlines)
+            if isPureHeaderPassage(passage) { return nil }
+            if passage.isEmpty { return nil }
+            // Strip internal page markers from passage text for cleaner LLM input
+            let markerPattern = "<<<PAGE_\\d+>>>\\n?"
+            if let regex = try? NSRegularExpression(pattern: markerPattern) {
+                passage = regex.stringByReplacingMatches(in: passage, range: NSRange(location: 0, length: (passage as NSString).length), withTemplate: "")
             }
-            return passage.isEmpty ? nil : passage
+            return AnnotatedPassage(text: passage, pageNumber: entry.page)
         }
 
         guard !passages.isEmpty else { return nil }
@@ -523,11 +599,17 @@ enum CitationScanner {
         }
 
         if !footnoteLines.isEmpty {
+            let lastPage = passages.last?.pageNumber ?? pageMarkers.last?.page ?? 1
             let footnotesBlock = "FOOTNOTES FOR THIS PAGE:\n" + footnoteLines.joined(separator: "\n")
-            passages.append(footnotesBlock)
+            passages.append(AnnotatedPassage(text: footnotesBlock, pageNumber: lastPage))
         }
 
-        return passages.joined(separator: "\n\n[…]\n\n")
+        return passages
+    }
+
+    static func formatAnnotatedPassages(_ passages: [AnnotatedPassage]) -> String {
+        passages.map { "[Page \($0.pageNumber) excerpt]:\n\($0.text)" }
+            .joined(separator: "\n\n[…]\n\n")
     }
 }
 
@@ -652,44 +734,6 @@ class LLMManager: ObservableObject {
     @Published var statusText: String = ""
     @Published var generationTimeText: String = ""
 
-    let textOnlySystemPrompt = """
-        You are an expert Legal AI Assistant specializing in Indian jurisprudence. Your task is to extract ALL cited legal precedents, case laws, and referenced court proceedings from the provided document text with 100% accuracy.
-
-        CRITICAL EXTRACTION RULES (APPLIES TO ALL INDIAN LEGAL DOCUMENTS):
-
-            1. FIELD DEFINITIONS & MAPPING:
-               - [Case Name]: The title of the parties in adversarial or title format (e.g., "Party A v. Party B", "In Re: XYZ Ltd.", "State of X v. Person Y").
-               - [Citation / Case Number]: Extract either standard volume reporters (e.g., SCC, AIR, ITR, ELT, SCR, SCC OnLine, Neutral Citations like YYYY:DHC:XXXX) OR court docket/filing numbers (e.g., "SLP(C) No. XXXX/YYYY", "W.P.(C) XXXX/YYYY", "CS(COMM) XXX/YYYY", "Crl.A. No. XXX/YYYY"). If no citation or docket number is mentioned in the text, write 'N/A'.
-               - [Context/Reason]: A concise 1-sentence summary of the legal principle, proposition, or reason the case was cited.
-
-            2. SEPARATION OF DOCKET NUMBERS AND CASE TITLES:
-               - When a proceeding is introduced by its filing/docket number followed by "titled" or "in the case of" (e.g., "...in W.P.(C) 1234/2021 titled 'ABC Corp v. Union of India'..."):
-                 * Put the party names ("ABC Corp v. Union of India") in [Case Name].
-                 * Put the filing number ("W.P.(C) 1234/2021") in [Citation or Case Number].
-                 * NEVER mark the citation as 'N/A' if a valid court filing/docket number is present.
-
-            3. DISTINCT PROCEEDINGS FOR SAME PARTIES:
-               - If the SAME party names appear with DIFFERENT citations or case numbers (such as an earlier Trial Court suit, a High Court Writ Petition, and a Supreme Court SLP, or multiple separate orders), extract EACH proceeding as a SEPARATE entry.
-               - Only deduplicate when BOTH the Case Name AND the Citation/Docket number refer to the exact same proceeding.
-
-            4. FLEXIBLE SYNTAX & REVERSE PHRASING:
-               - Recognize cases where the citation appears before the case name (e.g., "In (2020) 2 SCC 100, Party A v. Party B..." or "The decision at citation (2015) 3 ITR 50 is namely ABC Ltd. v. CIT"). Extract the case name and citation into their respective fields regardless of word order.
-
-            5. FULL ENTITY NAMES ACROSS LINE BREAKS:
-               - Always capture the complete legal entity name. Do not truncate names if they continue onto subsequent lines or across punctuation (e.g., include full company suffixes like "Pvt. Ltd.", "LLP", or full party descriptions).
-
-            6. EXCLUSIONS (DO NOT EXTRACT):
-               - EXCLUDE the primary heading/caption and case number of the main document currently being read.
-               - EXCLUDE running page footers, pagination lines (e.g., "Page X of Y"), digital signature blocks, and statutory acts/sections.
-
-        OUTPUT FORMAT:
-        [Case Name] — [Citation or Case Number] — [Context/Reason for citation]
-
-        (If no cited cases are found in the text, output: No cited cases found.)
-
-        OUTPUT:
-        """
-    
     let jsonSystemPrompt = """
     You are an expert Legal AI Assistant specializing in Indian jurisprudence and legal document analysis.
     Your task is to carefully read through Indian court filing documents and extract every legal case cited as a precedent or reference.
@@ -711,16 +755,19 @@ class LLMManager: ObservableObject {
       year: number | null;
       court: string | null;
       context: string | null;
+      pageNumber: number | null;
     };
     type DocumentExtractionResult = {
       citedCases: CitedCase[];
     };
+
+    7. Page Number: If the text is annotated with [Page N excerpt], set pageNumber to N. If the text has [Page N]: markers, use those. If ambiguous, use the first page number visible.
     """
 
     let passageExcerptNote = """
 
     INPUT FORMAT NOTE:
-    The text below consists of candidate excerpts surrounding cited cases joined with "[…]". Extract the cases cited directly from these excerpts.
+    The text below consists of candidate excerpts surrounding cited cases. Each excerpt is prefixed with [Page N excerpt] indicating the PDF page number. Passages from different regions are separated by "[…]". Extract the cases cited directly from these excerpts and set the pageNumber field to the page indicated.
     """
 
     let strictThinkingDirective = """
@@ -816,7 +863,6 @@ class LLMManager: ObservableObject {
     func generateStructuredOutput(
         pdfText: String,
         model: LLMModel,
-        outputFormat: OutputFormat,
         thinkingEnabled: Bool = true,
         preFilterEnabled: Bool = true,
         onThinkingToken: @MainActor @escaping (String) -> Void,
@@ -835,15 +881,35 @@ class LLMManager: ObservableObject {
         }
 
         let container = try await loadContainer(repoID: repoID, architectureType: model.architectureType)
-        let basePrompt = outputFormat == .json ? jsonSystemPrompt : textOnlySystemPrompt
-        
+        let basePrompt = jsonSystemPrompt
+
         let promptWithThinking = thinkingEnabled ? (basePrompt + strictThinkingDirective) : basePrompt
-        let activePrompt = preFilterEnabled ? (promptWithThinking + passageExcerptNote) : promptWithThinking
 
         let totalStartTime = CFAbsoluteTimeGetCurrent()
 
         let batches = Self.chunkByPages(pdfText)
         let isSingleBatch = batches.count == 1
+
+        // Self-reference extraction from first batch
+        statusText = "Identifying document's own case..."
+        let selfRef = try await extractSelfReference(
+            container: container,
+            firstBatchText: batches.first?.text ?? "",
+            thinkingEnabled: thinkingEnabled
+        )
+
+        // Build dynamic exclusion clause
+        var exclusionClause = ""
+        if let title = selfRef.caseTitle {
+            exclusionClause += "\n\n    SELF-REFERENCE EXCLUSION: This document's own case is \"\(title)\""
+            if let number = selfRef.caseNumber {
+                exclusionClause += " (Case No. \(number))"
+            }
+            exclusionClause += ". Do NOT include this case in your output — it is the document itself, not a cited precedent."
+        }
+
+        let promptWithExclusion = promptWithThinking + exclusionClause
+        let activePrompt = preFilterEnabled ? (promptWithExclusion + passageExcerptNote) : promptWithExclusion
 
         var chunkOutputs: [String] = []
         var chunkThinking: [String] = []
@@ -870,7 +936,17 @@ class LLMManager: ObservableObject {
                     print("⏭️  [SKIP] \(skippedMetrics.summaryLine)")
                     continue
                 }
-                textToSend = passages
+                textToSend = CitationScanner.formatAnnotatedPassages(passages)
+            } else {
+                // Replace internal page markers with human-readable labels
+                let markerPattern = "<<<PAGE_(\\d+)>>>\\n?"
+                if let regex = try? NSRegularExpression(pattern: markerPattern) {
+                    textToSend = regex.stringByReplacingMatches(
+                        in: textToSend,
+                        range: NSRange(location: 0, length: (textToSend as NSString).length),
+                        withTemplate: "[Page $1]:\n"
+                    )
+                }
             }
 
             let batchSource = preFilterEnabled
@@ -878,7 +954,7 @@ class LLMManager: ObservableObject {
                 : "a batch of pages (\(batch.pageRangeLabel))"
             let label: String? = isSingleBatch
                 ? nil
-                : "This is \(batchSource) of a larger legal document, part \(index + 1) of \(batches.count) overall. Extract cited cases found in THIS BATCH only."
+                : "This is \(batchSource) of a larger legal document, part \(index + 1) of \(batches.count) overall. Extract cited cases found in THIS BATCH only. Use the [Page N excerpt] or [Page N] markers to set each case's pageNumber field."
 
             print("▶️ [START] Batch \(index + 1)/\(batches.count) (\(batch.pageRangeLabel))...")
 
@@ -897,12 +973,10 @@ class LLMManager: ObservableObject {
             metrics.originalChars = batch.text.count
             metrics.sentChars = textToSend.count
 
-            if outputFormat == .json {
-                if let parsed = DocumentExtractionResult.parse(from: result.text) {
-                    metrics.parseStatus = .parsed(count: parsed.citedCases.count)
-                } else {
-                    metrics.parseStatus = .failed
-                }
+            if let parsed = DocumentExtractionResult.parse(from: result.text) {
+                metrics.parseStatus = .parsed(count: parsed.citedCases.count)
+            } else {
+                metrics.parseStatus = .failed
             }
 
             chunkOutputs.append(result.text)
@@ -912,22 +986,34 @@ class LLMManager: ObservableObject {
             print("✅ [COMPLETE] \(metrics.summaryLine)")
         }
 
-        let finalResult: String
+        var mergedResult: String
         if chunkOutputs.isEmpty {
-            finalResult = outputFormat == .json
-                ? "{\"citedCases\":[]}"
-                : "No cited cases found in this document."
+            mergedResult = "{\"citedCases\":[]}"
         } else if isSingleBatch {
-            finalResult = Self.dedupedIfPossible(chunkOutputs[0], outputFormat: outputFormat)
+            mergedResult = Self.dedupedIfPossible(chunkOutputs[0])
         } else {
             statusText = "Merging results from \(chunkOutputs.count) page-batches..."
-            finalResult = Self.mergeChunkOutputs(chunkOutputs, outputFormat: outputFormat)
+            mergedResult = Self.mergeChunkOutputs(chunkOutputs)
         }
 
+        // Safety-net: filter self-references from final output
+        if selfRef.caseTitle != nil,
+           let parsed = DocumentExtractionResult.parse(from: mergedResult) {
+            let filtered = Self.filterSelfReferences(parsed.citedCases, selfRef: selfRef)
+            if filtered.count < parsed.citedCases.count {
+                print("🧹 [SELF-REF FILTER] Removed \(parsed.citedCases.count - filtered.count) self-reference(s) from output")
+            }
+            let result = DocumentExtractionResult(citedCases: filtered)
+            if let data = try? JSONEncoder().encode(result), let json = String(data: data, encoding: .utf8) {
+                mergedResult = json
+            }
+        }
+
+        let finalResult = mergedResult
         let finalThinking = chunkThinking.joined(separator: "\n\n")
 
         let totalTimeTaken = CFAbsoluteTimeGetCurrent() - totalStartTime
-        Self.printRunSummary(allMetrics, totalSeconds: totalTimeTaken, outputFormat: outputFormat)
+        Self.printRunSummary(allMetrics, totalSeconds: totalTimeTaken)
 
         let formattedTime = String(format: "%.2f", totalTimeTaken)
         let totalDecodeSeconds = allMetrics.reduce(0.0) { $0 + $1.decodeSeconds }
@@ -946,9 +1032,70 @@ class LLMManager: ObservableObject {
     private struct PageBatch {
         let text: String
         let pageRangeLabel: String
+        let startPageNumber: Int
+        let endPageNumber: Int
     }
 
-    private static func printRunSummary(_ metrics: [ChunkMetrics], totalSeconds: Double, outputFormat: OutputFormat) {
+    private let selfReferencePrompt = """
+    You are reading the FIRST TWO PAGES of an Indian court document (judgment, order, or petition).
+    Your ONLY task: identify the document's OWN case title and case/citation number.
+    This is NOT about cited precedents — it is about the document itself.
+
+    Look for:
+    - The title block (e.g., "Party A v. Party B" or "In the matter of XYZ")
+    - The case/filing number (e.g., "SLP(C) No. 1234/2025", "W.P.(C) 5678/2024", "2025:INSC:789")
+
+    Return ONLY a valid JSON object, no markdown fences:
+    {"caseTitle": "Party A v. Party B", "caseNumber": "SLP(C) No. 1234/2025"}
+    If you cannot determine a field, set it to null.
+    """
+
+    private func extractSelfReference(
+        container: ModelContainer,
+        firstBatchText: String,
+        thinkingEnabled: Bool
+    ) async throws -> DocumentSelfReference {
+        let result = try await generateForChunk(
+            container: container,
+            activePrompt: selfReferencePrompt,
+            chunkText: firstBatchText,
+            chunkLabel: "Identify this document's own case title and citation/case number.",
+            thinkingEnabled: thinkingEnabled,
+            onThinkingToken: { _ in },
+            onToken: { _ in }
+        )
+        let selfRef = DocumentSelfReference.parse(from: result.text)
+        if let title = selfRef.caseTitle {
+            print("📋 [SELF-REF] Document title: \(title) | Number: \(selfRef.caseNumber ?? "N/A")")
+        } else {
+            print("📋 [SELF-REF] Could not identify document's own case title")
+        }
+        return selfRef
+    }
+
+    private static func filterSelfReferences(_ cases: [CitedCase], selfRef: DocumentSelfReference) -> [CitedCase] {
+        guard let selfTitle = selfRef.caseTitle else { return cases }
+        let selfTokens = nameTokens(selfTitle)
+        guard !selfTokens.isEmpty else { return cases }
+
+        let selfNumberKey: String? = selfRef.caseNumber.map { $0.lowercased().filter { $0.isLetter || $0.isNumber } }
+
+        return cases.filter { c in
+            let caseTokens = nameTokens(c.caseName)
+            guard !caseTokens.isEmpty else { return true }
+            let intersection = selfTokens.intersection(caseTokens)
+            let jaccard = Double(intersection.count) / Double(selfTokens.union(caseTokens).count)
+            if jaccard > 0.7 { return false }
+
+            if let selfNum = selfNumberKey, let citNum = c.citation {
+                let citKey = citNum.lowercased().filter { $0.isLetter || $0.isNumber }
+                if !citKey.isEmpty && citKey == selfNum { return false }
+            }
+            return true
+        }
+    }
+
+    private static func printRunSummary(_ metrics: [ChunkMetrics], totalSeconds: Double) {
         guard !metrics.isEmpty else { return }
 
         let prefill = metrics.reduce(0.0) { $0 + $1.prefillSeconds }
@@ -984,7 +1131,7 @@ class LLMManager: ObservableObject {
 
         print("""
 
-        ═══════════ RUN SUMMARY (\(outputFormat.rawValue)) ═══════════
+        ═══════════ RUN SUMMARY (JSON) ═══════════
         Batches:        \(metrics.count) (\(metrics.count - skipped.count) sent to the model)
         Pre-filter:     \(filterLine)
         Wall clock:     \(String(format: "%.2fs", totalSeconds))  (in-model: \(String(format: "%.2fs", measured)))
@@ -1005,31 +1152,36 @@ class LLMManager: ObservableObject {
         }
     }
 
+    static let internalPageMarker = "<<<PAGE_"
+    static let internalPageMarkerSuffix = ">>>"
+
     private static func chunkByPages(_ text: String, pagesPerBatch: Int = 2) -> [PageBatch] {
         let pages = text.components(separatedBy: PDFParser.pageBreakMarker)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
 
         guard pages.count > 1 else {
-            return [PageBatch(text: text, pageRangeLabel: "Full Document")]
+            let tagged = "[Page 1]:\n" + text
+            return [PageBatch(text: tagged, pageRangeLabel: "Full Document", startPageNumber: 1, endPageNumber: 1)]
         }
 
         var batches: [PageBatch] = []
         var index = 0
-        
+
         while index < pages.count {
             let end = min(index + pagesPerBatch, pages.count)
-            let batchPages = pages[index..<end]
-            let batchText = batchPages.joined(separator: "\n\n")
-            
+            let batchText = (index..<end).map { offset in
+                "\(internalPageMarker)\(offset + 1)\(internalPageMarkerSuffix)\n" + pages[offset]
+            }.joined(separator: "\n\n")
+
             let rangeLabel = (end - index == 1)
                 ? "page \(index + 1)"
                 : "pages \(index + 1)–\(end)"
 
-            batches.append(PageBatch(text: batchText, pageRangeLabel: rangeLabel))
+            batches.append(PageBatch(text: batchText, pageRangeLabel: rangeLabel, startPageNumber: index + 1, endPageNumber: end))
             index = end
         }
-        
+
         return batches
     }
 
@@ -1073,76 +1225,34 @@ class LLMManager: ObservableObject {
         return Set(words)
     }
 
-    private static func dedupedIfPossible(_ output: String, outputFormat: OutputFormat) -> String {
-        guard outputFormat == .json,
-              let parsed = DocumentExtractionResult.parse(from: output) else { return output }
+    private static func dedupedIfPossible(_ output: String) -> String {
+        guard let parsed = DocumentExtractionResult.parse(from: output) else { return output }
         let result = DocumentExtractionResult(citedCases: dedupeCitedCases(parsed.citedCases))
         guard let data = try? JSONEncoder().encode(result),
               let json = String(data: data, encoding: .utf8) else { return output }
         return json
     }
 
-    private static func mergeChunkOutputs(_ outputs: [String], outputFormat: OutputFormat) -> String {
+    private static func mergeChunkOutputs(_ outputs: [String]) -> String {
         var allCases: [CitedCase] = []
 
         for output in outputs {
             if let parsed = DocumentExtractionResult.parse(from: output) {
                 allCases.append(contentsOf: parsed.citedCases)
-            } else {
-                let lines = output.components(separatedBy: .newlines)
-                for line in lines {
-                    let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-                    guard !trimmed.isEmpty,
-                          !trimmed.hasPrefix("---"),
-                          !trimmed.lowercased().contains("no legal cases were cited"),
-                          !trimmed.lowercased().contains("no cited cases"),
-                          trimmed.uppercased() != "NONE" else { continue }
-                    
-                    var normalizedLine = trimmed
-                    if normalizedLine.hasPrefix("Case Name —") || normalizedLine.hasPrefix("Case Name -") {
-                        normalizedLine = normalizedLine.replacingOccurrences(of: "Case Name —", with: "")
-                                                       .replacingOccurrences(of: "Case Name -", with: "")
-                                                       .trimmingCharacters(in: .whitespacesAndNewlines)
-                    }
-
-                    guard normalizedLine.contains("—") || normalizedLine.contains("-") || normalizedLine.contains("SCC") || normalizedLine.contains("AIR") else { continue }
-
-                    let parts = normalizedLine.components(separatedBy: "—")
-                    let name = parts.first?.trimmingCharacters(in: .whitespacesAndNewlines) ?? normalizedLine
-                    let cit = parts.count > 1 ? parts[1].trimmingCharacters(in: .whitespacesAndNewlines) : nil
-                    let ctx = parts.count > 2 ? parts[2].trimmingCharacters(in: .whitespacesAndNewlines) : nil
-                    
-                    let normalizedName = name.replacingOccurrences(of: "Case Name —", with: "")
-                                             .replacingOccurrences(of: "Case Name -", with: "")
-                                             .trimmingCharacters(in: .whitespacesAndNewlines)
-                    
-                    allCases.append(CitedCase(caseName: normalizedName, citation: cit, year: nil, court: nil, context: ctx))
-                }
             }
         }
 
         let deduped = dedupeCitedCases(allCases)
 
         if deduped.isEmpty {
-            return outputFormat == .json ? "{\"citedCases\":[]}" : "No cited cases found in this document."
-        }
-
-        switch outputFormat {
-        case .json:
-            let result = DocumentExtractionResult(citedCases: deduped)
-            if let data = try? JSONEncoder().encode(result), let json = String(data: data, encoding: .utf8) {
-                return json
-            }
             return "{\"citedCases\":[]}"
-
-        case .text:
-            return deduped.map { c in
-                var line = "Case Name — " + c.caseName
-                if let citation = c.citation, !citation.isEmpty { line += " — \(citation)" }
-                if let context = c.context, !context.isEmpty { line += " — \(context)" }
-                return line
-            }.joined(separator: "\n")
         }
+
+        let result = DocumentExtractionResult(citedCases: deduped)
+        if let data = try? JSONEncoder().encode(result), let json = String(data: data, encoding: .utf8) {
+            return json
+        }
+        return "{\"citedCases\":[]}"
     }
 
     private func generateForChunk(

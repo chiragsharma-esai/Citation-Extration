@@ -1,9 +1,3 @@
-////  ContentView.swift
-//  Citation Extration
-//
-//  Created by Mac Neo on 07/08/26.
-//
-
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -16,9 +10,6 @@ struct ContentView: View {
     @State private var selectedModel: LLMModel = .gemma4
     @State private var selectedOutputFormat: OutputFormat = .text
     @State private var thinkingEnabled: Bool = true
-    // Regex pre-filter: send the model only the passages around citation-shaped text.
-    // Exposed as a toggle so it can be A/B'd against the full-text baseline on the
-    // same document — it trades a recall risk for speed and must be measured, not assumed.
     @State private var preFilterEnabled: Bool = true
     
     @State private var uploadedPDFText: String? = nil
@@ -29,11 +20,8 @@ struct ContentView: View {
     @State private var activePDFText: String? = nil
     @State private var lastGeneratedFormat: OutputFormat? = nil
    
-    // Dropdown controls & Thinking State properties
     @State private var currentThinking: String = ""
     @State private var isThinkingExpanded: Bool = true
-
-    //NEW: State variable for General Chat Question
     @State private var userQuestion: String = ""
     
     var body: some View {
@@ -62,25 +50,18 @@ struct ContentView: View {
                 .padding(8)
             }
             .navigationTitle("Chats")
-            .onChange(of: selectedHistory) {  oldValue, newValue in
+            .onChange(of: selectedHistory) { oldValue, newValue in
                 guard let newValue = newValue else { return }
                 currentOutput = newValue.extractedOutput
                 currentThinking = newValue.thinkingText
                 activePDFText = newValue.pdfText
                 lastGeneratedFormat = newValue.outputFormat
                 selectedOutputFormat = newValue.outputFormat
+                selectedModel = newValue.model
                 thinkingEnabled = newValue.thinkingEnabled
+                llmManager.generationTimeText = newValue.generationTimeText
                 uploadedPDFText = nil
                 errorMessage = nil
-               // 1. Restore Model & Thinking State
-                selectedModel = newValue.model
-                thinkingEnabled = newValue.thinkingEnabled
-                selectedModel = newValue.model
-                thinkingEnabled = newValue.thinkingEnabled
-                //  2. RESTORE TIME AND TOKENS/SEC HERE
-                llmManager.generationTimeText = newValue.generationTimeText
-                                uploadedPDFText = nil
-                                errorMessage = nil
             }
 
         } detail: {
@@ -88,19 +69,8 @@ struct ContentView: View {
             VStack(spacing: 20) {
                 
                 // Top Bar: Model + Output Format + Thinking Selection
-                HStack {
-                    // Real-time Status Text shown in the Top Bar during processing
-                    if llmManager.isGenerating {
-                        HStack(spacing: 8) {
-                            ProgressView()
-                                .scaleEffect(0.6)
-                                .frame(width: 16, height: 16)
-                            Text(llmManager.statusText)
-                                .font(.caption)
-                                .foregroundColor(.blue)
-                                .bold()
-                        }
-                    } else if !llmManager.generationTimeText.isEmpty {
+                HStack(spacing: 12) {
+                    if !llmManager.isGenerating && !llmManager.generationTimeText.isEmpty {
                         Text(llmManager.generationTimeText)
                             .font(.caption)
                             .foregroundColor(.green)
@@ -161,10 +131,9 @@ struct ContentView: View {
                     ScrollView {
                         VStack(alignment: .leading, spacing: 16) {
                             
-                            // COLLAPSIBLE THOUGHTS CARD (Only rendered if Thinking is turned ON and has content)
+                            // COLLAPSIBLE THOUGHTS CARD
                             if thinkingEnabled && !currentThinking.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                                 VStack(alignment: .leading, spacing: 12) {
-                                    // Header Button
                                     Button(action: {
                                         withAnimation(.easeInOut(duration: 0.2)) {
                                             isThinkingExpanded.toggle()
@@ -188,13 +157,11 @@ struct ContentView: View {
                                     }
                                     .buttonStyle(.plain)
                                     
-                                    // Collapsible Content
                                     if isThinkingExpanded {
                                         VStack(alignment: .leading, spacing: 12) {
                                             Divider()
                                                 .background(Color.secondary.opacity(0.15))
                                             
-                                            // Dynamic markdown rendering (supports bold headers out-of-the-box)
                                             Text(currentThinking)
                                                 .font(.body)
                                                 .foregroundColor(.secondary)
@@ -204,7 +171,6 @@ struct ContentView: View {
                                             Divider()
                                                 .background(Color.secondary.opacity(0.15))
                                             
-                                            // Collapse prompt at the bottom
                                             Button(action: {
                                                 withAnimation(.easeInOut(duration: 0.2)) {
                                                     isThinkingExpanded = false
@@ -235,7 +201,7 @@ struct ContentView: View {
                                 )
                             }
                             
-                            // EXECUTION TIME DISPLAY (Only appears when output is ready)
+                            // EXECUTION TIME DISPLAY
                             if !llmManager.generationTimeText.isEmpty && !currentOutput.isEmpty {
                                 let timeString = llmManager.generationTimeText
                                     .replacingOccurrences(of: "Time taken: ", with: "")
@@ -248,10 +214,9 @@ struct ContentView: View {
                                     .padding(.top, 4)
                             }
                             
-                            // 📋 Response Output (Kept hidden until generation is completely finished)
+                            // Response Output
                             if !currentOutput.isEmpty {
                                 if let parsedResult, !parsedResult.citedCases.isEmpty {
-                                    // Structured JSON parsed successfully
                                     VStack(alignment: .leading, spacing: 12) {
                                         ForEach(parsedResult.citedCases) { citedCase in
                                             VStack(alignment: .leading, spacing: 4) {
@@ -274,7 +239,6 @@ struct ContentView: View {
                                     Text("No cited cases found in this document.")
                                         .foregroundColor(.secondary).padding()
                                 } else {
-                                    // General Chat Answer / Text Output
                                     Text(currentOutput)
                                         .padding()
                                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -304,11 +268,11 @@ struct ContentView: View {
                 
                 Spacer()
                 
-                // MARK: - Upload Area (Only shown when starting a brand new extraction)
-                if currentOutput.isEmpty && currentThinking.isEmpty && !llmManager.isGenerating {
+                // MARK: - Upload Area & Bottom Loading
+                if currentOutput.isEmpty && currentThinking.isEmpty {
                     VStack(spacing: 20) {
                         
-                        // --- OPTION 1: PDF UPLOAD ---
+                        // Option: PDF Upload
                         if uploadedPDFText == nil {
                             Button(action: selectPDF) {
                                 VStack {
@@ -317,26 +281,37 @@ struct ContentView: View {
                                 }
                                 .frame(maxWidth: .infinity)
                                 .padding(40)
-                                  .background(RoundedRectangle(cornerRadius: 12).stroke(style: StrokeStyle(lineWidth: 2, dash: [5])).foregroundColor(.gray))
+                                .background(RoundedRectangle(cornerRadius: 12).stroke(style: StrokeStyle(lineWidth: 2, dash: [5])).foregroundColor(.gray))
                             }
                             .buttonStyle(.plain)
+                            .disabled(llmManager.isGenerating)
                         } else {
                             Text("File Uploaded Successfully!").foregroundColor(.green)
                             Button(action: extractCitations) {
-                                if llmManager.isGenerating { ProgressView().scaleEffect(0.8) } else { Text("Extract").bold() }
+                                if llmManager.isGenerating {
+                                    ProgressView().scaleEffect(0.8)
+                                } else {
+                                    Text("Extract").bold()
+                                }
                             }
                             .buttonStyle(.borderedProminent).controlSize(.large).disabled(llmManager.isGenerating)
                         }
-                        
-                       
 
-                        // Status & Errors
+                        // Bottom Status, Spinner & Download Progress Bar
                         if llmManager.isGenerating && !llmManager.statusText.isEmpty {
-                            Text(llmManager.statusText).font(.caption).foregroundColor(.secondary)
-                            if llmManager.downloadProgress > 0 && llmManager.downloadProgress < 1 {
-                                ProgressView(value: llmManager.downloadProgress).frame(width: 200)
+                            VStack(spacing: 10) {
+                                Text(llmManager.statusText)
+                                    .font(.subheadline)
+                                    .foregroundColor(.secondary)
+                                
+                                if llmManager.downloadProgress > 0 && llmManager.downloadProgress < 1 {
+                                    ProgressView(value: llmManager.downloadProgress, total: 1.0)
+                                        .progressViewStyle(.linear)
+                                        .frame(width: 250)
+                                }
                             }
                         }
+                        
                         if let errorMessage {
                             Text(errorMessage).font(.caption).foregroundColor(.red).multilineTextAlignment(.center).frame(maxWidth: 500)
                         }
@@ -362,6 +337,7 @@ struct ContentView: View {
         lastGeneratedFormat = nil
         userQuestion = ""
     }
+    
     private func regenerateIfFormatChanged(to newFormat: OutputFormat) {
         guard newFormat != lastGeneratedFormat else { return }
         guard let text = activePDFText, !currentOutput.isEmpty else { return }
@@ -394,7 +370,6 @@ struct ContentView: View {
                     return
                 }
                 
-                // Update UI once after completion
                 self.currentThinking = result.thinkingText
                 self.currentOutput = result.responseText
                 self.lastGeneratedFormat = newFormat
@@ -402,7 +377,7 @@ struct ContentView: View {
                 if let selectedHistory, let index = histories.firstIndex(where: { $0.id == selectedHistory.id }) {
                     histories[index].extractedOutput = result.responseText
                     histories[index].thinkingText = result.thinkingText
-                    histories[index].thinkingEnabled = thinkingEnabled // 🌟 Preserve toggle state
+                    histories[index].thinkingEnabled = thinkingEnabled
                     histories[index].outputFormat = newFormat
                     self.selectedHistory = histories[index]
                 }
@@ -459,7 +434,6 @@ struct ContentView: View {
                     return
                 }
 
-                // Update UI once after completion
                 self.currentThinking = result.thinkingText
                 self.currentOutput = result.responseText
                 self.activePDFText = text

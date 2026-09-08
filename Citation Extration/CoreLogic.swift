@@ -25,7 +25,7 @@ struct ChatHistory: Identifiable, Hashable {
     var outputFormat: OutputFormat
     var generationTimeText: String
     var thinkingText: String = ""
-    var thinkingEnabled: Bool = true // 🌟 Saved toggle state
+    var thinkingEnabled: Bool = true
     var model: LLMModel
 }
 
@@ -120,7 +120,7 @@ enum LLMModel: String, CaseIterable, Identifiable {
 
     var id: String { rawValue }
 
-    var hubRepoID: String? {
+    var hubRepoID: String?{
         switch self {
         case .gemma4: return "mlx-community/gemma-4-e2b-it-4bit"
         case .gemma3n: return "mlx-community/gemma-3n-E2B-it-lm-4bit"
@@ -327,13 +327,15 @@ struct ChunkResult: Sendable {
     let thinkingText: String
 }
 
-// MARK: -  STEP 1: UNIVERSAL HIGH-PRECISION CITATION SCANNER
+// MARK: - STEP 1: UNIVERSAL HIGH-PRECISION CITATION SCANNER
 enum CitationScanner {
     
-    static let defaultSentenceWindow = 2
+    static let defaultCharsBefore = 200
+    static let defaultCharsAfter = 200
 
     private static let reporterTokens: [String] = [
-        "ELT", "AIR", "ITR", "SCC", "CRLJ", "CTR", "TAXMAN", "LLJ",
+        "MANU", "MANUPATRA", "MhLJ", "Mh.L.J.", "SCR", "S.C.R.",
+        "ELT", "AIR", "ITR", "SCC", "SSC", "CRLJ", "CTR", "TAXMAN", "LLJ",
         "DLT", "Scale", "RLT", "STC", "SCR", "JT", "TTJ", "ITD",
         "ECR", "CPJ", "CLR", "AD", "Supreme", "DRJ", "SLT", "SLR",
         "STR", "ARBLR", "SCJ", "AllMR", "UJ", "FLR", "SRJ", "Crimes",
@@ -348,11 +350,12 @@ enum CitationScanner {
         "MahLJ", "AllER", "CutLT", "KerLR", "LILR", "BLR", "VKN", "KLJ",
         "AllCriC", "SCL", "GujLR", "PLR", "JKLR", "GCD", "PLJR", "RLR",
         "GujLH", "OELT", "BLJ", "BomLR", "KerLJ", "MIA", "SCt", "UPLBEC",
-        "SarPCJ", "ACE", "WLR", "CalLT", "MWN", "TAC", "SCC OnLine",
+        "SarPCJ", "ACE", "WLR", "CalLT", "MWN", "TAC",
         "EWHC", "UKSC"
     ]
 
     private static let neutralTokens: [String] = [
+        "Civil Appeal", "C.A.", "Criminal Appeal", "Crl.A.", "Company Appeal",
         "APHC", "KER", "KHC", "RJ-JD", "CGHC", "INSC", "MPHC-JBP", "GUJHC",
         "HHC", "MPHC-IND", "MPHC-GWL", "RJ-JP", "DHC", "BHC-NAG", "MHC", "BHC-AUG",
         "PHHC", "AHC", "GAU-AS", "KHC-D", "MLHC", "KHC-K", "AHC-LKO", "BHC-OS",
@@ -360,57 +363,63 @@ enum CitationScanner {
         "BHC-AS", "JKLHC-JMU", "UHC", "JKLHC-SGR", "OHC", "CHC-JP"
     ]
 
+    private static let docketTokens: [String] = [
+        //"SLP(C)", "SLP(Crl)", "SLP", "W.P.(C)", "WP(C)", "W.P.(Crl)", "WP(Crl)", "W.P.", "WP",
+        "CS(COMM)", "CS(OS)", "CS", "FAO", "RFA", "CRL.A.", "Crl.A.", "O.M.P.", "ARB.P.",
+        "MAT.APP.", "CONT.CAS", "CRL.M.C.", "CM APPL."
+    ]
+
     static var includePartyMarker = true
 
     private static let citationRegex: NSRegularExpression = {
-        func tolerant(_ token: String) -> String {
+        func tolerantAcronym(_ token: String) -> String {
             let escaped = NSRegularExpression.escapedPattern(for: token)
-            guard token.allSatisfy({ $0.isUppercase || $0 == "&" || $0 == " " }) else { return escaped }
-            return token.map { "\(NSRegularExpression.escapedPattern(for: String($0)))\\.?" }.joined()
+            guard token.allSatisfy({ $0.isLetter || $0 == "&" || $0 == " " || $0 == "-" }) else {
+                return "(?i:\(escaped))"
+            }
+            let pattern = token.map { char -> String in
+                if char == " " { return "\\s+" }
+                return "\(NSRegularExpression.escapedPattern(for: String(char)))\\.?"
+            }.joined()
+            return "(?i:\(pattern))"
         }
 
-        let tokens = (reporterTokens + neutralTokens)
+        // Standard reporters & neutral citations
+        let standardTokens = (reporterTokens + neutralTokens)
             .sorted { ($0.count, $0) > ($1.count, $1) }
-            .map(tolerant)
+            .map(tolerantAcronym)
             .joined(separator: "|")
 
-        var pattern = "(?<![A-Za-z])(?:\(tokens))(?:\\s*\\([A-Za-z&.\\- ]{1,14}\\))?(?![A-Za-z])"
+        // Docket patterns e.g. SLP(C) No. 6092 of 2025, CS(COMM) 583/2025, W.P.(C) 1206/2025
+        let docketEscaped = docketTokens
+            .sorted { ($0.count, $0) > ($1.count, $1) }
+            .map { NSRegularExpression.escapedPattern(for: $0) }
+            .joined(separator: "|")
+        let docketPattern = "(?i:(?:\(docketEscaped)))\\s*(?:\\(?[A-Za-z]+\\)?\\s*)?(?:No\\.?|Nos\\.?)?\\s*\\d+"
+
+        // Dedicated pattern for SCC OnLine variants: "SCC OnLineBom 1262", "SCC OnLine Del 4029", "SCC Online 2024"
+        let sccOnlinePattern = "(?i:SCC\\s*OnLine(?:\\s*[A-Za-z]{2,6})?\\s*\\d+)"
+
+        var combinedPatterns: [String] = [
+            "(?<![A-Za-z])(?:\(standardTokens))(?:\\s*\\([A-Za-z&.\\- ]{1,14}\\))?(?![A-Za-z])",
+            sccOnlinePattern,
+            docketPattern
+        ]
 
         if includePartyMarker {
-            pattern += "|(?<=\\w[\\s\\-])(?i:v|vs|v/s)\\.?(?=[\\s\\-,;:]|$)|(?i:\\bversus\\b)"
+            // Party markers: v., vs., versus, In Re:, titled '...'
+            let partyPattern = "(?<=\\w[\\s\\-,])(?i:v|vs|v/s)\\.?(?=[\\s\\-,;:]|$)|(?i:\\bversus\\b)|(?i:\\bIn\\s+Re:?\\b)|(?i:\\btitled\\s+['\"‘][A-Za-z])"
+            combinedPatterns.append(partyPattern)
         }
 
-        return try! NSRegularExpression(pattern: pattern, options: [])
+        let fullPattern = combinedPatterns.joined(separator: "|")
+        return try! NSRegularExpression(pattern: fullPattern, options: [])
     }()
 
-    private static let abbreviations = "No|Nos|Art|Sec|Cl|Ors|Anr|Ltd|Pvt|Co|Corp|Govt|Hon|Mr|Mrs|Ms|Dr|Prof|Rs|Vol|para|paras|pp|Ed|vs|v|etc|viz|Cri|Cr|LJ|JJ|AIR|ILR|SCC|SCR"
-
-    private static func sentenceStarts(in text: NSString) -> [Int] {
-        var masked = text as String
-
-        func mask(_ pattern: String, _ template: String) {
-            guard let re = try? NSRegularExpression(pattern: pattern) else { return }
-            let full = NSRange(location: 0, length: (masked as NSString).length)
-            masked = re.stringByReplacingMatches(in: masked, range: full, withTemplate: template)
-        }
-
-        mask("(?<=\\d)\\.(?=\\d)", "\u{0}")
-        mask("(?<![A-Za-z])([A-Za-z])\\.", "$1\u{0}")
-        mask("\\b(\(abbreviations))\\.", "$1\u{0}")
-
-        guard let re = try? NSRegularExpression(pattern: "(?<=[.!?])\\s+|\\n{2,}") else { return [0] }
-        let full = NSRange(location: 0, length: (masked as NSString).length)
-        var starts = [0]
-        re.enumerateMatches(in: masked, range: full) { match, _, _ in
-            if let end = match?.range.upperBound, end < text.length { starts.append(end) }
-        }
-        return starts
-    }
-
-    private static func isPureHeaderSentence(_ sentence: String) -> Bool {
-        guard sentence.count < 350 else { return false }
+    private static func isPureHeaderPassage(_ text: String) -> Bool {
+        guard text.count < 350 else { return false }
         
-        let upper = sentence.uppercased()
+        let upper = text.uppercased()
         let hasHeaderMarker = (upper.contains("APPELLANT") && upper.contains("RESPONDENT")) ||
                               (upper.contains("PETITIONER") && upper.contains("RESPONDENT")) ||
                               (upper.contains("IN THE SUPREME COURT") || upper.contains("IN THE HIGH COURT"))
@@ -425,58 +434,87 @@ enum CitationScanner {
         return citationRegex.firstMatch(in: text, range: NSRange(location: 0, length: ns.length)) != nil
     }
 
-    static func candidatePassages(in text: String, window: Int = defaultSentenceWindow) -> String? {
+    private static func snapToWordBoundaries(in text: NSString, range: NSRange) -> NSRange {
+        var start = range.location
+        var end = range.location + range.length
+        
+        // Snap start backwards to nearest whitespace or newline (up to 40 chars search)
+        if start > 0 {
+            var searchIdx = start
+            while searchIdx > 0 && searchIdx > start - 40 {
+                let char = text.character(at: searchIdx)
+                if char == 10 || char == 32 { // \n or space
+                    start = searchIdx + 1
+                    break
+                }
+                searchIdx -= 1
+            }
+        }
+        
+        // Snap end forwards to nearest whitespace or newline (up to 40 chars search)
+        if end < text.length {
+            var searchIdx = end
+            while searchIdx < text.length && searchIdx < end + 40 {
+                let char = text.character(at: searchIdx)
+                if char == 10 || char == 32 { // \n or space
+                    end = searchIdx
+                    break
+                }
+                searchIdx += 1
+            }
+        }
+        
+        return NSRange(location: start, length: max(0, end - start))
+    }
+
+    static func candidatePassages(
+        in text: String,
+        charsBefore: Int = defaultCharsBefore,
+        charsAfter: Int = defaultCharsAfter
+    ) -> String? {
         let ns = text as NSString
         let full = NSRange(location: 0, length: ns.length)
         let matches = citationRegex.matches(in: text, range: full)
         guard !matches.isEmpty else { return nil }
 
-        let starts = sentenceStarts(in: ns)
-
-        func sentenceIndex(of offset: Int) -> Int {
-            var low = 0, high = starts.count - 1, result = 0
-            while low <= high {
-                let mid = (low + high) / 2
-                if starts[mid] <= offset { result = mid; low = mid + 1 } else { high = mid - 1 }
-            }
-            return result
-        }
-
-        var ranges: [(lo: Int, hi: Int)] = []
-
+        // 1. Expand character windows around each regex hit
+        var rawRanges: [NSRange] = []
         for match in matches {
-            let i = sentenceIndex(of: match.range.location)
-            let sentenceStart = starts[i]
-            let sentenceEnd = (i + 1 < starts.count) ? starts[i + 1] : ns.length
-            let matchSentence = ns.substring(with: NSRange(location: sentenceStart, length: sentenceEnd - sentenceStart))
-
-            if isPureHeaderSentence(matchSentence) {
-                continue
-            }
-
-            let lo = starts[max(0, i - window)]
-            let hiIndex = i + window + 1
-            let hi = hiIndex < starts.count ? starts[hiIndex] : ns.length
-
-            ranges.append((lo: min(lo, match.range.location), hi: max(hi, match.range.upperBound)))
+            let start = max(0, match.range.location - charsBefore)
+            let end = min(ns.length, match.range.location + match.range.length + charsAfter)
+            rawRanges.append(NSRange(location: start, length: end - start))
         }
 
-        guard !ranges.isEmpty else { return nil }
-
-        var merged: [(lo: Int, hi: Int)] = []
-        for range in ranges.sorted(by: { $0.lo < $1.lo }) {
-            if let last = merged.last, range.lo <= last.hi {
-                merged[merged.count - 1].hi = max(last.hi, range.hi)
+        // 2. Merge overlapping / nearby character windows (within 60 characters)
+        let sortedRanges = rawRanges.sorted { $0.location < $1.location }
+        var mergedRanges: [NSRange] = []
+        for range in sortedRanges {
+            if let last = mergedRanges.last {
+                let lastEnd = last.location + last.length
+                if range.location <= lastEnd + 60 {
+                    mergedRanges[mergedRanges.count - 1].length = max(lastEnd, range.location + range.length) - last.location
+                } else {
+                    mergedRanges.append(range)
+                }
             } else {
-                merged.append(range)
+                mergedRanges.append(range)
             }
         }
 
-        var passages = merged.map {
-            ns.substring(with: NSRange(location: $0.lo, length: $0.hi - $0.lo))
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-        }.filter { !$0.isEmpty }
+        // 3. Snap to clean word boundaries and extract candidate text passages
+        var passages = mergedRanges.compactMap { range -> String? in
+            let snapped = snapToWordBoundaries(in: ns, range: range)
+            guard snapped.length > 0 else { return nil }
+            let passage = ns.substring(with: snapped).trimmingCharacters(in: .whitespacesAndNewlines)
+            if isPureHeaderPassage(passage) {
+                return nil
+            }
+            return passage.isEmpty ? nil : passage
+        }
 
+        guard !passages.isEmpty else { return nil }
+
+        // 4. Preserve Footnote block at the end of the batch
         let lines = text.components(separatedBy: .newlines)
         let footnoteLines = lines.filter { line in
             let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -493,12 +531,13 @@ enum CitationScanner {
     }
 }
 
-// MARK: -  HIGH-PRECISION STREAM ROUTER
+
+// MARK: - HIGH-PRECISION STREAM ROUTER
 class StreamingReasoningParser {
     enum State {
-        case preThinking  // Waiting strictly for reasoning tokens
-        case thinking     // Inside thoughts stream
-        case normal       // Inside final response stream
+        case preThinking
+        case thinking
+        case normal
     }
     
     private var state: State = .preThinking
@@ -524,12 +563,10 @@ class StreamingReasoningParser {
         while !buffer.isEmpty {
             switch state {
             case .preThinking:
-                // Look strictly for start of reasoning tokens. Discards echoed prefix noise.
                 if let startRange = findStartDelimiter(in: buffer) {
                     state = .thinking
                     buffer = String(buffer[startRange.upperBound...])
                 } else {
-                    // Prevent excessive memory growth if no tag is found yet
                     let maxKeep = 100
                     if buffer.count > maxKeep {
                         buffer = String(buffer.suffix(maxKeep))
@@ -538,7 +575,6 @@ class StreamingReasoningParser {
                 }
                 
             case .thinking:
-                // Look strictly for end of reasoning tokens.
                 if let endRange = findEndDelimiter(in: buffer) {
                     let thinkingText = String(buffer[..<endRange.lowerBound])
                     if !thinkingText.isEmpty {
@@ -547,7 +583,6 @@ class StreamingReasoningParser {
                     state = .normal
                     buffer = String(buffer[endRange.upperBound...])
                 } else {
-                    // Safeguard look-ahead characters so the delimiter doesn't get split
                     let safetyMargin = 20
                     if buffer.count > safetyMargin {
                         let sendText = String(buffer.prefix(buffer.count - safetyMargin))
@@ -558,7 +593,6 @@ class StreamingReasoningParser {
                 }
                 
             case .normal:
-                // Once thinking is finished, stream the final response smoothly
                 onNormal(buffer)
                 buffer = ""
             }
@@ -569,7 +603,6 @@ class StreamingReasoningParser {
         if !buffer.isEmpty {
             switch state {
             case .preThinking:
-                // If the stream finished without thinking delimiters, dump the entire text as normal
                 onNormal(buffer)
             case .thinking:
                 onThinking(buffer)
@@ -620,20 +653,42 @@ class LLMManager: ObservableObject {
     @Published var generationTimeText: String = ""
 
     let textOnlySystemPrompt = """
-    You are an expert Legal AI Assistant specializing in Indian jurisprudence.
-    You are an expert legal AI assistant. Your task is to extract ALL cited legal precedents (case laws) from the provided document text with 100% accuracy.
+        You are an expert Legal AI Assistant specializing in Indian jurisprudence. Your task is to extract ALL cited legal precedents, case laws, and referenced court proceedings from the provided document text with 100% accuracy.
 
-        CRITICAL RULES FOR EXTRACTION (APPLIES TO ALL LEGAL DOCUMENTS):
+        CRITICAL EXTRACTION RULES (APPLIES TO ALL INDIAN LEGAL DOCUMENTS):
 
-        1. FOOTNOTE MAPPING (CRUCIAL): Legal documents often mention a case name in the main body text followed by a number, while the actual citation (e.g., SCC, AIR, EWHC, etc.) is located at the bottom of the page in the footnotes. You MUST carefully scan the entire text, match the footnote number from the main text to the corresponding footnote at the bottom, and combine them accurately.
-        2. STRICT ONE-TO-ONE EXTRACTION: Never group multiple citations together. Every single case mentioned must have its own separate, distinct entry. Never assign a legal citation to a general English word.
-        3. EXCLUDE THE MAIN DOCUMENT: Do not extract the title, heading, or the primary case number of the document you are reading. Only extract PAST cases that are cited as references, precedents, or examples within the text.
-        4. ZERO HALLUCINATION: Only extract cases and citations that are explicitly written in the text. If a case is mentioned but has no citation, output 'N/A' for the citation. Do not guess, invent, or search external knowledge.
+            1. FIELD DEFINITIONS & MAPPING:
+               - [Case Name]: The title of the parties in adversarial or title format (e.g., "Party A v. Party B", "In Re: XYZ Ltd.", "State of X v. Person Y").
+               - [Citation / Case Number]: Extract either standard volume reporters (e.g., SCC, AIR, ITR, ELT, SCR, SCC OnLine, Neutral Citations like YYYY:DHC:XXXX) OR court docket/filing numbers (e.g., "SLP(C) No. XXXX/YYYY", "W.P.(C) XXXX/YYYY", "CS(COMM) XXX/YYYY", "Crl.A. No. XXX/YYYY"). If no citation or docket number is mentioned in the text, write 'N/A'.
+               - [Context/Reason]: A concise 1-sentence summary of the legal principle, proposition, or reason the case was cited.
+
+            2. SEPARATION OF DOCKET NUMBERS AND CASE TITLES:
+               - When a proceeding is introduced by its filing/docket number followed by "titled" or "in the case of" (e.g., "...in W.P.(C) 1234/2021 titled 'ABC Corp v. Union of India'..."):
+                 * Put the party names ("ABC Corp v. Union of India") in [Case Name].
+                 * Put the filing number ("W.P.(C) 1234/2021") in [Citation or Case Number].
+                 * NEVER mark the citation as 'N/A' if a valid court filing/docket number is present.
+
+            3. DISTINCT PROCEEDINGS FOR SAME PARTIES:
+               - If the SAME party names appear with DIFFERENT citations or case numbers (such as an earlier Trial Court suit, a High Court Writ Petition, and a Supreme Court SLP, or multiple separate orders), extract EACH proceeding as a SEPARATE entry.
+               - Only deduplicate when BOTH the Case Name AND the Citation/Docket number refer to the exact same proceeding.
+
+            4. FLEXIBLE SYNTAX & REVERSE PHRASING:
+               - Recognize cases where the citation appears before the case name (e.g., "In (2020) 2 SCC 100, Party A v. Party B..." or "The decision at citation (2015) 3 ITR 50 is namely ABC Ltd. v. CIT"). Extract the case name and citation into their respective fields regardless of word order.
+
+            5. FULL ENTITY NAMES ACROSS LINE BREAKS:
+               - Always capture the complete legal entity name. Do not truncate names if they continue onto subsequent lines or across punctuation (e.g., include full company suffixes like "Pvt. Ltd.", "LLP", or full party descriptions).
+
+            6. EXCLUSIONS (DO NOT EXTRACT):
+               - EXCLUDE the primary heading/caption and case number of the main document currently being read.
+               - EXCLUDE running page footers, pagination lines (e.g., "Page X of Y"), digital signature blocks, and statutory acts/sections.
 
         OUTPUT FORMAT:
-        Case Name — Citation — Context/Reason for citation
-        (If no cases are found in the text, output exactly: "No cited cases found.")
-    """
+        [Case Name] — [Citation or Case Number] — [Context/Reason for citation]
+
+        (If no cited cases are found in the text, output: No cited cases found.)
+
+        OUTPUT:
+        """
     
     let jsonSystemPrompt = """
     You are an expert Legal AI Assistant specializing in Indian jurisprudence and legal document analysis.
@@ -684,12 +739,35 @@ class LLMManager: ObservableObject {
             return cached
         }
 
-        statusText = "Downloading/Loading \(repoID)..."
+        downloadProgress = 0.0
+        statusText = "Checking model repository..."
         let configuration = ModelConfiguration(id: repoID)
 
         let progressClosure: @Sendable (Progress) -> Void = { progress in
             Task { @MainActor in
                 self.downloadProgress = progress.fractionCompleted
+                
+                let completedMB = Double(progress.completedUnitCount) / (1024 * 1024)
+                let totalMB = Double(progress.totalUnitCount) / (1024 * 1024)
+                let pct = Int(progress.fractionCompleted * 100)
+                
+                if progress.totalUnitCount > 0 && totalMB > 1.0 {
+                    if totalMB >= 1024 {
+                        let completedGB = completedMB / 1024.0
+                        let totalGB = totalMB / 1024.0
+                        self.statusText = String(format: "Downloading: %.2f GB / %.2f GB (%d%%)", completedGB, totalGB, pct)
+                    } else {
+                        self.statusText = String(format: "Downloading: %.1f MB / %.1f MB (%d%%)", completedMB, totalMB, pct)
+                    }
+                } else if progress.fractionCompleted > 0 {
+                    self.statusText = "Downloading model: \(pct)%"
+                } else {
+                    self.statusText = "Connecting & downloading model..."
+                }
+                
+                if progress.fractionCompleted >= 1.0 {
+                    self.statusText = "Loading model into memory..."
+                }
             }
         }
 
@@ -715,8 +793,8 @@ class LLMManager: ObservableObject {
         await Self.warmup(container: container)
 
         loadedContainers[repoID] = container
-        statusText = ""
         downloadProgress = 1.0
+        statusText = ""
         return container
     }
 
@@ -749,8 +827,12 @@ class LLMManager: ObservableObject {
         }
 
         isGenerating = true
+        downloadProgress = 0.0
         generationTimeText = "Processing..."
-        defer { isGenerating = false }
+        defer {
+            isGenerating = false
+            downloadProgress = 0.0
+        }
 
         let container = try await loadContainer(repoID: repoID, architectureType: model.architectureType)
         let basePrompt = outputFormat == .json ? jsonSystemPrompt : textOnlySystemPrompt
@@ -956,33 +1038,29 @@ class LLMManager: ObservableObject {
     }
 
     private static func dedupeCitedCases(_ cases: [CitedCase]) -> [CitedCase] {
-        var uniqueCases: [CitedCase] = []
-        var seenCitations = Set<String>()
-        var seenNames = Set<String>()
+            var uniqueCases: [CitedCase] = []
+            var seenCompositeKeys = Set<String>()
 
-        for c in cases {
-            let cleanName = c.caseName.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !cleanName.isEmpty, cleanName.lowercased() != "none", cleanName.lowercased() != "unknown case" else { continue }
+            for c in cases {
+                let cleanName = c.caseName.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !cleanName.isEmpty,
+                      cleanName.lowercased() != "none", 
+                      cleanName.lowercased() != "unknown case" else { continue }
 
-            let nameKey = dedupeKey(cleanName)
-            let currentCitation = c.citation?.lowercased().filter { $0.isLetter || $0.isNumber } ?? ""
+                let nameKey = dedupeKey(cleanName)
+                let citationKey = dedupeKey(c.citation ?? "nocitation")
+                
+                // FIX: Composite key checks BOTH Name AND Citation/Docket Number
+                // This ensures W.P.(C) 1206/2025 and SLP(C) 8544/2025 are BOTH preserved!
+                let compositeKey = nameKey + "_" + citationKey
 
-            var isDuplicate = seenNames.contains(nameKey)
-
-            if !isDuplicate, !currentCitation.isEmpty {
-                isDuplicate = seenCitations.contains(currentCitation)
-            }
-
-            if !isDuplicate {
-                seenNames.insert(nameKey)
-                if !currentCitation.isEmpty {
-                    seenCitations.insert(currentCitation)
+                if !seenCompositeKeys.contains(compositeKey) {
+                    seenCompositeKeys.insert(compositeKey)
+                    uniqueCases.append(c)
                 }
-                uniqueCases.append(c)
             }
+            return uniqueCases
         }
-        return uniqueCases
-    }
 
     private static func nameTokens(_ name: String) -> Set<String> {
         let noise: Set<String> = ["versus", "state", "union", "india", "ltd", "limited",
@@ -1092,16 +1170,16 @@ class LLMManager: ObservableObject {
                     prompt: .chat(chatMessages),
                     additionalContext: [
                         "enable_thinking": thinkingEnabled,
-                        "thinking_budget": 192,
-                        "max_thinking_tokens": 192
+                        //"thinking_budget": 192,
+                      //    "max_thinking_tokens": 192
                     ]
                 )
             )
 
             var generateParameters = GenerateParameters(temperature: 0.0)
             generateParameters.topP = 0.95
-            generateParameters.repetitionPenalty = 1.15
-            generateParameters.maxTokens = 1024
+            generateParameters.repetitionPenalty = 1.0
+            generateParameters.maxTokens = 2048
 
             let stream = try MLXLMCommon.generate(
                 input: input,

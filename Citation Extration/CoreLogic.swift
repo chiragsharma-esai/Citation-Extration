@@ -641,18 +641,20 @@ class StreamingReasoningParser {
     
     func process(_ token: String) {
         buffer += token
-        
+
         while !buffer.isEmpty {
             switch state {
             case .preThinking:
                 if let startRange = findStartDelimiter(in: buffer) {
                     state = .thinking
                     buffer = String(buffer[startRange.upperBound...])
+                } else if buffer.count > 300 {
+                    // Model didn't produce thinking delimiters — treat everything as normal output
+                    state = .normal
+                    onNormal(buffer)
+                    buffer = ""
+                    return
                 } else {
-                    let maxKeep = 100
-                    if buffer.count > maxKeep {
-                        buffer = String(buffer.suffix(maxKeep))
-                    }
                     return
                 }
                 
@@ -1346,6 +1348,9 @@ class LLMManager: ObservableObject {
 
             metrics.thinkingChars = thinkingText.count
             metrics.responseChars = fullText.count
+
+            let preview = String(fullText.prefix(300))
+            print("🔍 [RAW OUTPUT] \(fullText.count) chars — preview: \(preview)")
 
             return ChunkResult(text: fullText, metrics: metrics, thinkingText: thinkingText)
         }

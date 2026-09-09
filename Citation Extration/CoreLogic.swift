@@ -100,12 +100,196 @@ struct DocumentExtractionResult: Codable {
             text = String(text[..<fenceEnd.lowerBound])
         }
 
-        guard let firstBrace = text.firstIndex(of: "{"),
-              let lastBrace = text.lastIndex(of: "}") else { return nil }
-        text = String(text[firstBrace...lastBrace])
+        // Small models often echo the schema (`type DocumentExtractionResult = {...}`)
+        // before emitting the real object, so locate the object that actually
+        // carries a `citedCases` ARRAY rather than trusting the first brace.
+        if let candidate = extractDataObject(from: text) {
+            // Attempt 1: as-is.
+            if let data = candidate.data(using: .utf8),
+               let decoded = try? JSONDecoder().decode(DocumentExtractionResult.self, from: data) {
+                return decoded
+            }
 
-        guard let data = text.data(using: .utf8) else { return nil }
-        return try? JSONDecoder().decode(DocumentExtractionResult.self, from: data)
+            // Attempt 2: models sometimes emit TypeScript object-literal syntax
+            // with unquoted keys — quote them and retry.
+            let quoted = quoteBareKeys(candidate)
+            if let data = quoted.data(using: .utf8),
+               let decoded = try? JSONDecoder().decode(DocumentExtractionResult.self, from: data) {
+                return decoded
+            }
+        }
+
+        // Attempt 3: the model dropped the wrapper and emitted a bare array.
+        if let arrayText = extractBareArray(from: text) {
+            for variant in [arrayText, quoteBareKeys(arrayText)] {
+                if let data = variant.data(using: .utf8),
+                   let cases = try? JSONDecoder().decode([CitedCase].self, from: data) {
+                    return DocumentExtractionResult(citedCases: cases)
+                }
+            }
+        }
+
+        return nil
+    }
+
+    /// Extracts a top-level `[...]` array, used when the model omits the
+    /// `citedCases` wrapper object entirely.
+    private static func extractBareArray(from text: String) -> String? {
+        let chars = Array(text)
+        guard let start = chars.firstIndex(of: "[") else { return nil }
+
+        var depth = 0
+        var inString = false
+        var escaped = false
+
+        for k in start..<chars.count {
+            let c = chars[k]
+            if inString {
+                if escaped { escaped = false }
+                else if c == "\\" { escaped = true }
+                else if c == "\"" { inString = false }
+                continue
+            }
+            if c == "\"" { inString = true; continue }
+            if c == "[" { depth += 1 }
+            if c == "]" {
+                depth -= 1
+                if depth == 0 { return String(chars[start...k]) }
+            }
+        }
+        return nil
+    }
+
+    /// Finds the JSON object containing a `citedCases` array, brace-matching from
+    /// its opening brace and repairing unclosed brackets if generation was truncated.
+    private static func extractDataObject(from text: String) -> String? {
+        let chars = Array(text)
+
+        // Locate a `citedCases` key whose value opens an array.
+        var keyIndex: Int? = nil
+        let needle = Array("citedCases")
+        var i = 0
+        while i + needle.count <= chars.count {
+            if Array(chars[i..<(i + needle.count)]) == needle {
+                var j = i + needle.count
+                while j < chars.count, chars[j] == "\"" || chars[j].isWhitespace { j += 1 }
+                if j < chars.count, chars[j] == ":" {
+                    j += 1
+                    while j < chars.count, chars[j].isWhitespace { j += 1 }
+                    if j < chars.count, chars[j] == "[" {
+                        keyIndex = i
+                        break
+                    }
+                }
+            }
+            i += 1
+        }
+        guard let foundKey = keyIndex else { return nil }
+
+        // Walk back to the brace that opens the enclosing object.
+        var start = foundKey
+        while start >= 0, chars[start] != "{" { start -= 1 }
+        guard start >= 0 else { return nil }
+
+        // Brace/bracket match forward, ignoring delimiters inside string literals.
+        var stack: [Character] = []
+        var inString = false
+        var escaped = false
+        var end: Int? = nil
+
+        var k = start
+        while k < chars.count {
+            let c = chars[k]
+            if inString {
+                if escaped { escaped = false }
+                else if c == "\\" { escaped = true }
+                else if c == "\"" { inString = false }
+            } else {
+                switch c {
+                case "\"": inString = true
+                case "{": stack.append("}")
+                case "[": stack.append("]")
+                case "}", "]":
+                    if stack.last == c { stack.removeLast() }
+                    if stack.isEmpty { end = k }
+                default: break
+                }
+            }
+            if end != nil { break }
+            k += 1
+        }
+
+        if let end {
+            return String(chars[start...end])
+        }
+
+        // Truncated output — close whatever is still open.
+        var repaired = String(chars[start...])
+        if inString { repaired += "\"" }
+        while let closer = stack.popLast() { repaired.append(closer) }
+        return repaired
+    }
+
+    /// Quotes unquoted object keys (TypeScript literal style) without touching
+    /// text inside string values.
+    private static func quoteBareKeys(_ json: String) -> String {
+        var result = ""
+        var inString = false
+        var escaped = false
+        let chars = Array(json)
+        var i = 0
+
+        while i < chars.count {
+            let c = chars[i]
+
+            if inString {
+                result.append(c)
+                if escaped { escaped = false }
+                else if c == "\\" { escaped = true }
+                else if c == "\"" { inString = false }
+                i += 1
+                continue
+            }
+
+            if c == "\"" {
+                inString = true
+                result.append(c)
+                i += 1
+                continue
+            }
+
+            if c == "{" || c == "," {
+                result.append(c)
+                i += 1
+
+                var whitespace = ""
+                while i < chars.count, chars[i].isWhitespace {
+                    whitespace.append(chars[i])
+                    i += 1
+                }
+
+                var identifier = ""
+                while i < chars.count, chars[i].isLetter || chars[i].isNumber || chars[i] == "_" {
+                    identifier.append(chars[i])
+                    i += 1
+                }
+
+                var lookahead = i
+                while lookahead < chars.count, chars[lookahead].isWhitespace { lookahead += 1 }
+
+                if !identifier.isEmpty, lookahead < chars.count, chars[lookahead] == ":" {
+                    result += whitespace + "\"" + identifier + "\""
+                } else {
+                    result += whitespace + identifier
+                }
+                continue
+            }
+
+            result.append(c)
+            i += 1
+        }
+
+        return result
     }
 }
 
@@ -747,23 +931,25 @@ class LLMManager: ObservableObject {
     4. Missing Data: If a detail is missing, return null. Do not hallucinate.
     5. No Repeats: Emit each unique case only once.
     6. NEVER extract footnote numbers or naked years as case names. Combine them into the citation field.
+    7. Page Number: If the text is annotated with [Page N excerpt], set pageNumber to N. If the text has [Page N]: markers, use those. If ambiguous, use the first page number visible.
 
     OUTPUT FORMAT:
-    Respond with ONLY a single valid JSON object, and nothing else (no ``` markdown fences).
+    Respond with ONLY a single valid JSON object and nothing else.
+    Do NOT write markdown fences. Do NOT write type declarations. Do NOT explain.
+    Every key and every string value MUST be wrapped in double quotes.
 
-    type CitedCase = {
-      caseName: string;
-      citation: string | null;
-      year: number | null;
-      court: string | null;
-      context: string | null;
-      pageNumber: number | null;
-    };
-    type DocumentExtractionResult = {
-      citedCases: CitedCase[];
-    };
+    Return exactly this shape:
+    {"citedCases":[{"caseName":"Excel Wear v. Union of India","citation":"(1978) 4 SCC 224","year":1978,"court":"Supreme Court of India","context":"Cited on the scope of Article 19(1)(g).","pageNumber":5}]}
 
-    7. Page Number: If the text is annotated with [Page N excerpt], set pageNumber to N. If the text has [Page N]: markers, use those. If ambiguous, use the first page number visible.
+    Field rules:
+    - "caseName": string, required
+    - "citation": string or null
+    - "year": number or null
+    - "court": string or null
+    - "context": string or null
+    - "pageNumber": number or null
+
+    If no cases are cited, return exactly: {"citedCases":[]}
     """
 
     let passageExcerptNote = """
@@ -1089,6 +1275,13 @@ class LLMManager: ObservableObject {
             let jaccard = Double(intersection.count) / Double(selfTokens.union(caseTokens).count)
             if jaccard > 0.7 { return false }
 
+            // Documents often cite themselves in shortened form, which scores low on
+            // Jaccard. Treat it as a self-reference when every distinctive token of the
+            // shorter name appears in the other. Require >= 2 tokens so a single shared
+            // surname (e.g. "Singh v. State of Punjab") is not wrongly dropped.
+            let minCount = min(selfTokens.count, caseTokens.count)
+            if minCount >= 2 && intersection.count == minCount { return false }
+
             if let selfNum = selfNumberKey, let citNum = c.citation {
                 let citKey = citNum.lowercased().filter { $0.isLetter || $0.isNumber }
                 if !citKey.isEmpty && citKey == selfNum { return false }
@@ -1219,7 +1412,13 @@ class LLMManager: ObservableObject {
     private static func nameTokens(_ name: String) -> Set<String> {
         let noise: Set<String> = ["versus", "state", "union", "india", "ltd", "limited",
                                   "anr", "another", "ors", "others", "the", "and", "bank",
-                                  "company", "corporation", "pvt", "private"]
+                                  "company", "corporation", "pvt", "private",
+                                  // Procedural / party-role words carry no identity and
+                                  // otherwise dilute similarity against shortened forms.
+                                  "petitioner", "petitioners", "respondent", "respondents",
+                                  "appellant", "appellants", "applicant", "applicants",
+                                  "plaintiff", "plaintiffs", "defendant", "defendants",
+                                  "through", "secretary", "govt", "government", "with"]
         let words = name.lowercased()
             .split(whereSeparator: { !$0.isLetter && !$0.isNumber })
             .map(String.init)

@@ -545,11 +545,11 @@ struct ChunkResult: Sendable {
 // MARK: - STEP 1: UNIVERSAL HIGH-PRECISION CITATION SCANNER
 enum CitationScanner {
     
-    static let defaultCharsBefore = 200
-    static let defaultCharsAfter = 200
+    static let defaultCharsBefore = 350
+    static let defaultCharsAfter = 350
 
     /// Windows closer together than this are joined into one passage.
-    static let mergeGap = 200
+    static let mergeGap = 150
 
     private static let reporterTokens: [String] = [
         "MANU", "MANUPATRA", "MhLJ", "Mh.L.J.", "SCR", "S.C.R.",
@@ -582,7 +582,7 @@ enum CitationScanner {
     ]
 
     private static let docketTokens: [String] = [
-        //"SLP(C)", "SLP(Crl)", "SLP", "W.P.(C)", "WP(C)", "W.P.(Crl)", "WP(Crl)", "W.P.", "WP",
+        "SLP(C)", "SLP(Crl)", "SLP", "W.P.(C)", "WP(C)", "W.P.(Crl)", "WP(Crl)", "W.P.", "WP",
         "CS(COMM)", "CS(OS)", "CS", "FAO", "RFA", "CRL.A.", "Crl.A.", "O.M.P.", "ARB.P.",
         "MAT.APP.", "CONT.CAS", "CRL.M.C.", "CM APPL."
     ]
@@ -983,7 +983,7 @@ class LLMManager: ObservableObject {
     Follow these strict guidelines:
     1. Identify Case Names: Look for standard adversarial formats (e.g., "X v. Y", "X vs. Y", "In Re: X").
     2. Identify Citations: Look for standard Indian legal reporters (SCC, AIR, SCR, SCALE, JT, SCC OnLine, Neutral citations).
-    3. Context: Briefly summarize the legal principle or reason why the case was cited.
+    3. Context: Briefly summarize the legal principle or reason why the case was cited(if any).
     4. Missing Data: If a detail is missing, return null. Do not hallucinate.
     5. No Repeats: Emit each unique case only once.
     6. NEVER extract footnote numbers or naked years as case names. Combine them into the citation field.
@@ -1542,7 +1542,9 @@ class LLMManager: ObservableObject {
                 Chat.Message(role: .system, content: activePrompt),
                 Chat.Message(role: .user, content: userContent)
             ]
-
+            print("Chat Message: START\n")
+            print("chats: \(chatMessages)")
+            print("Chat Message END \n")
             let input = try await context.processor.prepare(
                 input: UserInput(
                     prompt: .chat(chatMessages),

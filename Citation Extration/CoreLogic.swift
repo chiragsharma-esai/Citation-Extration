@@ -934,12 +934,16 @@ class LLMManager: ObservableObject {
     7. Page Number: If the text is annotated with [Page N excerpt], set pageNumber to N. If the text has [Page N]: markers, use those. If ambiguous, use the first page number visible.
 
     OUTPUT FORMAT:
-    Respond with ONLY a single valid JSON object and nothing else.
-    Do NOT write markdown fences. Do NOT write type declarations. Do NOT explain.
+    Respond with ONE JSON object and nothing else. Do NOT write markdown fences.
+    Do NOT write type declarations. Do NOT explain.
     Every key and every string value MUST be wrapped in double quotes.
 
-    Return exactly this shape:
-    {"citedCases":[{"caseName":"Excel Wear v. Union of India","citation":"(1978) 4 SCC 224","year":1978,"court":"Supreme Court of India","context":"Cited on the scope of Article 19(1)(g).","pageNumber":5}]}
+    That one object wraps an ARRAY. Put EVERY distinct case cited in the text
+    into the "citedCases" array — it may hold one, many, or zero entries.
+    Never stop after the first case.
+
+    Return exactly this shape (this example shows two cases; emit as many as the text cites):
+    {"citedCases":[{"caseName":"Excel Wear v. Union of India","citation":"(1978) 4 SCC 224","year":1978,"court":"Supreme Court of India","context":"Cited on the scope of Article 19(1)(g).","pageNumber":5},{"caseName":"S.R. Bommai v. Union of India","citation":"(1994) 3 SCC 1","year":1994,"court":"Supreme Court of India","context":"Cited on secularism as basic structure.","pageNumber":6}]}
 
     Field rules:
     - "caseName": string, required

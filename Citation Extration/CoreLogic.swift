@@ -1492,9 +1492,26 @@ class LLMManager: ObservableObject {
             )
 
             var generateParameters = GenerateParameters(temperature: 0.0)
-            generateParameters.topP = 0.95
-            generateParameters.repetitionPenalty = 1.0
             generateParameters.maxTokens = 2048
+
+            // Penalties are deliberately left nil (off).
+            //
+            // Valid JSON REQUIRES heavy token repetition: "caseName", "citation",
+            // "year", "court", "context", "pageNumber" plus { } " , : recur for every
+            // element of citedCases. Any repetition/presence/frequency penalty makes
+            // those structural tokens progressively less likely as the array grows,
+            // so the model drifts toward an early EOS and the array truncates after a
+            // few entries. Do not enable them to "reduce repetition" here.
+            //
+            // Note repetitionPenalty = 1.0 is NOT the same as off: GenerateParameters
+            // builds a PenaltyProcessor for any non-zero value, so 1.0 runs the
+            // processor on every token to perform a mathematical no-op.
+            generateParameters.repetitionPenalty = nil
+            generateParameters.presencePenalty = nil
+            generateParameters.frequencyPenalty = nil
+
+            // topP is intentionally unset: temperature 0 selects ArgMaxSampler, which
+            // bypasses top-p/top-k/min-p entirely, so setting it would be dead config.
 
             let stream = try MLXLMCommon.generate(
                 input: input,

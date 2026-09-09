@@ -68,27 +68,47 @@ struct PDFViewerRepresentable: NSViewRepresentable {
         }
     }
 
+    /// Finds the citation, searching ONLY the pages it could legitimately be on.
+    ///
+    /// This used to fall back to `allSelections.first` — the first match anywhere in
+    /// the document. With a case cited on several pages that meant clicking the
+    /// occurrence on page 6 scrolled to page 34, because page 34 happened to hold
+    /// the first match. A row must never scroll somewhere the case was not cited.
+    ///
+    /// The allowed pages are the target page plus the one after it, since a case
+    /// name can straddle a page break. If nothing matches there we return nil, and
+    /// the caller scrolls to the correct page without a highlight — being on the
+    /// right page unhighlighted beats being on the wrong page highlighted.
     private func findBestSelection(in document: PDFDocument, pageIndex: Int?) -> PDFSelection? {
         let candidates = buildSearchCandidates()
 
-        for candidate in candidates {
-            let trimmed = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty else { continue }
+        guard let pageIndex else {
+            // No page information at all — only then may we search the whole document.
+            for candidate in candidates {
+                let trimmed = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else { continue }
+                if let first = document.findString(trimmed, withOptions: .caseInsensitive).first {
+                    return first
+                }
+            }
+            return nil
+        }
 
-            if let pageIndex, let page = document.page(at: pageIndex) {
-                if let sel = findOnPage(page, text: trimmed), sel.string != nil, !sel.string!.isEmpty {
+        let allowedPages: [PDFPage] = [pageIndex, pageIndex + 1]
+            .filter { $0 >= 0 && $0 < document.pageCount }
+            .compactMap { document.page(at: $0) }
+        guard !allowedPages.isEmpty else { return nil }
+
+        // Try every candidate string on the target page before allowing the
+        // straddle page, so the exact page always wins.
+        for page in allowedPages {
+            for candidate in candidates {
+                let trimmed = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else { continue }
+                if let sel = findOnPage(page, text: trimmed),
+                   let s = sel.string, !s.isEmpty {
                     return sel
                 }
-            }
-
-            let allSelections = document.findString(trimmed, withOptions: .caseInsensitive)
-            if let pageIndex {
-                if let match = allSelections.first(where: { $0.pages.first == document.page(at: pageIndex) }) {
-                    return match
-                }
-            }
-            if let first = allSelections.first {
-                return first
             }
         }
 

@@ -23,7 +23,7 @@ struct ContentView: View {
     @State private var isThinkingExpanded: Bool = false
 
     @State private var parsedCases: [CitedCase] = []
-    @State private var selectedCaseID: String? = nil
+    @State private var selectedCaseID: UUID? = nil
 
     @State private var pdfDocumentForViewer: PDFDocument? = nil
     @State private var highlightText: String? = nil

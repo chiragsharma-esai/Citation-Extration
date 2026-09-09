@@ -31,7 +31,10 @@ struct ChatHistory: Identifiable, Hashable {
 
 // MARK: - Structured Extraction Schema
 struct CitedCase: Codable, Identifiable, Hashable {
-    var id: String { caseName + (citation ?? "") + (year.map(String.init) ?? "") + (pageNumber.map(String.init) ?? "") }
+    /// Identity is per-row, not per-content. Repeated citations are kept now that
+    /// deduplication is gone, so two rows can be identical in every field; a
+    /// content-derived id would collide and break Table selection. Not encoded.
+    let id = UUID()
     let caseName: String
     let citation: String?
     let year: Int?
@@ -1020,7 +1023,8 @@ class LLMManager: ObservableObject {
     2. Identify Citations: Look for standard Indian legal reporters (SCC, AIR, SCR, SCALE, JT, SCC OnLine, Neutral citations).
     3. Context: Briefly summarize the legal principle or reason why the case was cited(if any).
     4. Missing Data: If a detail is missing, return null. Do not hallucinate.
-    5. No Repeats: Emit each unique case only once.
+    5. Repeats: If the same case is cited more than once for different points, emit it
+       once per occurrence, each with its own context and page number. Do not merge them.
     6. NEVER extract footnote numbers or naked years as case names. Combine them into the citation field.
     7. Page Number: Set pageNumber from the page annotations in the text.
        - "[Page N excerpt]" means everything under it is on page N.
@@ -1184,8 +1188,14 @@ class LLMManager: ObservableObject {
 
         let totalStartTime = CFAbsoluteTimeGetCurrent()
 
-        let batches = Self.chunkByPages(Self.stripRunningHeaders(pdfText))
+        let cleanedText = Self.stripRunningHeaders(pdfText)
+        let batches = Self.chunkByPages(cleanedText)
         let isSingleBatch = batches.count == 1
+
+        // Kept in real page order (blanks included) so index + 1 is the true PDF
+        // page number when page attributions are resolved against the text later.
+        let pageTexts = cleanedText.components(separatedBy: PDFParser.pageBreakMarker)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
 
         // Self-reference extraction from first batch
         statusText = "Identifying document's own case..."
@@ -1287,7 +1297,7 @@ class LLMManager: ObservableObject {
         if chunkOutputs.isEmpty {
             mergedResult = "{\"citedCases\":[]}"
         } else if isSingleBatch {
-            mergedResult = Self.dedupedIfPossible(chunkOutputs[0])
+            mergedResult = Self.cleanedIfPossible(chunkOutputs[0])
         } else {
             statusText = "Merging results from \(chunkOutputs.count) page-batches..."
             mergedResult = Self.mergeChunkOutputs(chunkOutputs)
@@ -1302,6 +1312,7 @@ class LLMManager: ObservableObject {
             if finalCases.count < parsed.citedCases.count {
                 print("🧹 [SELF-REF FILTER] Removed \(parsed.citedCases.count - finalCases.count) duplicate self-reference(s) from the cited list")
             }
+            finalCases = Self.resolvePageNumbers(finalCases, pageTexts: pageTexts)
             if let selfRow = Self.makeSelfReferenceRow(selfRef) {
                 finalCases.insert(selfRow, at: 0)
             }
@@ -1590,9 +1601,11 @@ class LLMManager: ObservableObject {
     }
 
     private static func chunkByPages(_ text: String, pagesPerBatch: Int = 2) -> [PageBatch] {
+        // Blank pages are KEPT. Page numbers come from this array's indices, so
+        // dropping a blank page would shift every later page number down by one and
+        // send the viewer to the wrong page.
         let pages = text.components(separatedBy: PDFParser.pageBreakMarker)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
 
         guard pages.count > 1 else {
             let tagged = "[Page 1]:\n" + text
@@ -1604,49 +1617,86 @@ class LLMManager: ObservableObject {
 
         while index < pages.count {
             let end = min(index + pagesPerBatch, pages.count)
-            let batchText = (index..<end).map { offset in
-                "\(internalPageMarker)\(offset + 1)\(internalPageMarkerSuffix)\n" + pages[offset]
-            }.joined(separator: "\n\n")
+            // Skip blank pages when building the text, but keep their numbering.
+            let batchText = (index..<end)
+                .filter { !pages[$0].isEmpty }
+                .map { offset in
+                    "\(internalPageMarker)\(offset + 1)\(internalPageMarkerSuffix)\n" + pages[offset]
+                }
+                .joined(separator: "\n\n")
 
-            let rangeLabel = (end - index == 1)
-                ? "page \(index + 1)"
-                : "pages \(index + 1)–\(end)"
-
-            batches.append(PageBatch(text: batchText, pageRangeLabel: rangeLabel, startPageNumber: index + 1, endPageNumber: end))
+            if !batchText.isEmpty {
+                let rangeLabel = (end - index == 1)
+                    ? "page \(index + 1)"
+                    : "pages \(index + 1)–\(end)"
+                batches.append(PageBatch(text: batchText, pageRangeLabel: rangeLabel, startPageNumber: index + 1, endPageNumber: end))
+            }
             index = end
         }
 
         return batches
     }
 
-    private static func dedupeKey(_ text: String) -> String {
-        text.lowercased().filter { $0.isLetter || $0.isNumber }
+    /// Replaces the model's page guess with the page the case actually appears on.
+    ///
+    /// The model's number was unreliable by construction: an excerpt window opens
+    /// ~350 characters before its match, so a case at the top of page 6 sits in a
+    /// window that begins on page 5 and gets labelled accordingly. Page numbers
+    /// drive both the table and the PDF viewer's scroll, so they have to be exact.
+    ///
+    /// Matching uses the distinctive name tokens rather than the literal string, so
+    /// a case the model wrote as "... v. Union of India" still matches the document's
+    /// "... v. UOI". Where a case appears on several pages, the occurrence NEAREST
+    /// the model's estimate wins, so repeated citations each keep their own page
+    /// instead of all collapsing onto the first.
+    private static func resolvePageNumbers(_ cases: [CitedCase], pageTexts: [String]) -> [CitedCase] {
+        guard !pageTexts.isEmpty else { return cases }
+        let lowered = pageTexts.map { $0.lowercased() }
+
+        return cases.map { c in
+            guard !c.isSelfReference else { return c }
+
+            let tokens = nameTokens(c.caseName)
+            guard !tokens.isEmpty else { return c }
+
+            var occurrences: [Int] = []
+            for (i, page) in lowered.enumerated() where tokens.allSatisfy({ page.contains($0) }) {
+                occurrences.append(i + 1)
+            }
+            guard !occurrences.isEmpty else { return c }
+
+            let hint = c.pageNumber ?? occurrences[0]
+            let resolved = occurrences.min { abs($0 - hint) < abs($1 - hint) } ?? occurrences[0]
+            guard resolved != c.pageNumber else { return c }
+
+            print("📄 [PAGE FIX] \(c.caseName): model said \(c.pageNumber.map(String.init) ?? "nil") → text says \(resolved)")
+            return CitedCase(
+                caseName: c.caseName,
+                citation: c.citation,
+                year: c.year,
+                court: c.court,
+                context: c.context,
+                pageNumber: resolved,
+                isSelfReference: c.isSelfReference
+            )
+        }
     }
 
-    private static func dedupeCitedCases(_ cases: [CitedCase]) -> [CitedCase] {
-            var uniqueCases: [CitedCase] = []
-            var seenCompositeKeys = Set<String>()
-
-            for c in cases {
-                let cleanName = c.caseName.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !cleanName.isEmpty,
-                      cleanName.lowercased() != "none", 
-                      cleanName.lowercased() != "unknown case" else { continue }
-
-                let nameKey = dedupeKey(cleanName)
-                let citationKey = dedupeKey(c.citation ?? "nocitation")
-                
-                // FIX: Composite key checks BOTH Name AND Citation/Docket Number
-                // This ensures W.P.(C) 1206/2025 and SLP(C) 8544/2025 are BOTH preserved!
-                let compositeKey = nameKey + "_" + citationKey
-
-                if !seenCompositeKeys.contains(compositeKey) {
-                    seenCompositeKeys.insert(compositeKey)
-                    uniqueCases.append(c)
-                }
-            }
-            return uniqueCases
+    /// Drops placeholder rows only. Repeated cases are deliberately KEPT.
+    ///
+    /// Deduplication used to collapse rows sharing a name and citation, but a case
+    /// cited several times is cited for different propositions on different pages,
+    /// and each occurrence is a real result with its own context and page number.
+    /// Collapsing them also hid conflicting citations for the same case name —
+    /// exactly the signal that matters when checking authorities.
+    private static func removingPlaceholders(_ cases: [CitedCase]) -> [CitedCase] {
+        cases.filter { c in
+            let cleanName = c.caseName.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !cleanName.isEmpty else { return false }
+            let lowered = cleanName.lowercased()
+            return lowered != "none" && lowered != "unknown case"
         }
+    }
 
     private static func nameTokens(_ name: String) -> Set<String> {
         let noise: Set<String> = ["versus", "state", "union", "india", "ltd", "limited",
@@ -1665,9 +1715,9 @@ class LLMManager: ObservableObject {
         return Set(words)
     }
 
-    private static func dedupedIfPossible(_ output: String) -> String {
+    private static func cleanedIfPossible(_ output: String) -> String {
         guard let parsed = DocumentExtractionResult.parse(from: output) else { return output }
-        let result = DocumentExtractionResult(citedCases: dedupeCitedCases(parsed.citedCases))
+        let result = DocumentExtractionResult(citedCases: removingPlaceholders(parsed.citedCases))
         guard let data = try? JSONEncoder().encode(result),
               let json = String(data: data, encoding: .utf8) else { return output }
         return json
@@ -1682,13 +1732,13 @@ class LLMManager: ObservableObject {
             }
         }
 
-        let deduped = dedupeCitedCases(allCases)
+        let cleaned = removingPlaceholders(allCases)
 
-        if deduped.isEmpty {
+        if cleaned.isEmpty {
             return "{\"citedCases\":[]}"
         }
 
-        let result = DocumentExtractionResult(citedCases: deduped)
+        let result = DocumentExtractionResult(citedCases: cleaned)
         if let data = try? JSONEncoder().encode(result), let json = String(data: data, encoding: .utf8) {
             return json
         }

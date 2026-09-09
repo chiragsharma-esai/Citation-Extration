@@ -1016,7 +1016,7 @@ class LLMManager: ObservableObject {
 
     let jsonSystemPrompt = """
     You are an expert Legal AI Assistant specializing in Indian jurisprudence and legal document analysis.
-    Your task is to carefully read through Indian court filing documents and extract every legal case cited as a precedent or reference.
+    Your task is to carefully read through Indian court filing documents and extract EVERY legal case named in them — whether relied on as authority, distinguished, overruled, quoted, or merely discussed while checking whether a citation is genuine.
 
     Follow these strict guidelines:
     1. Identify Case Names: Look for standard adversarial formats (e.g., "X v. Y", "X vs. Y", "In Re: X").
@@ -1053,6 +1053,19 @@ class LLMManager: ObservableObject {
 
     Return exactly this shape (this example shows two cases; emit as many as the text cites):
     {"citedCases":[{"caseName":"Excel Wear v. Union of India","citation":"(1978) 4 SCC 224","year":1978,"court":"Supreme Court of India","context":"Cited on the scope of Article 19(1)(g).","pageNumber":5},{"caseName":"S.R. Bommai v. Union of India","citation":"(1994) 3 SCC 1","year":1994,"court":"Supreme Court of India","context":"Cited on secularism as basic structure.","pageNumber":6}]}
+
+    9. Extract a case whenever its name appears in adversarial form, WHATEVER the
+       reason it is mentioned. Do not limit yourself to cases relied on as authority.
+       Also extract cases that are:
+       - distinguished, doubted, overruled or disapproved;
+       - named as the real case behind a disputed or mis-recorded citation. When the
+         text says "the judgment given at citation X is namely A v. B", extract
+         "A v. B" with citation X;
+       - reported as not found, unverifiable or non-existent. Still extract them, and
+         say so in the context field (e.g. "Court found this case non-existent on
+         physical verification").
+       A court checking whether citations are genuine is exactly when these cases
+       matter most, so never skip one because it is not being followed as precedent.
 
     Field rules:
     - "caseName": string, required

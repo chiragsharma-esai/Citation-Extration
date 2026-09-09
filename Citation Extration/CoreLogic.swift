@@ -548,6 +548,9 @@ enum CitationScanner {
     static let defaultCharsBefore = 200
     static let defaultCharsAfter = 200
 
+    /// Windows closer together than this are joined into one passage.
+    static let mergeGap = 200
+
     private static let reporterTokens: [String] = [
         "MANU", "MANUPATRA", "MhLJ", "Mh.L.J.", "SCR", "S.C.R.",
         "ELT", "AIR", "ITR", "SCC", "SSC", "CRLJ", "CTR", "TAXMAN", "LLJ",
@@ -623,7 +626,14 @@ enum CitationScanner {
 
         if includePartyMarker {
             // Party markers: v., vs., versus, In Re:, titled '...'
-            let partyPattern = "(?<=\\w[\\s\\-,])(?i:v|vs|v/s)\\.?(?=[\\s\\-,;:]|$)|(?i:\\bversus\\b)|(?i:\\bIn\\s+Re:?\\b)|(?i:\\btitled\\s+['\"‘][A-Za-z])"
+            //
+            // The lookbehind must accept more than \w before the separator. Party
+            // names frequently end in a parenthetical, an abbreviation dot or a
+            // quote — e.g. "M Ismail Faruqui (Dr) v. Union of India" or
+            // "State of U.P. (Through Secretary) v. Ram Kumar". Requiring \w there
+            // silently dropped those cases: no match meant no excerpt window, so the
+            // case never reached the model at all.
+            let partyPattern = "(?<=[\\w\\)\\]\\.'’\"][\\s\\-,])(?i:v|vs|v/s)\\.?(?=[\\s\\-,;:]|$)|(?i:\\bversus\\b)|(?i:\\bIn\\s+Re:?\\b)|(?i:\\btitled\\s+['\"‘][A-Za-z])"
             combinedPatterns.append(partyPattern)
         }
 
@@ -741,13 +751,16 @@ enum CitationScanner {
             rawEntries.append((range: NSRange(location: start, length: end - start), page: page))
         }
 
-        // 2. Merge overlapping / nearby character windows (within 60 characters)
+        // 2. Merge overlapping / nearby character windows.
+        // Bridging a modest gap keeps a passage readable instead of cutting a
+        // sentence in half with "[…]", which costs the model the context that
+        // explains why a case was cited.
         let sorted = rawEntries.sorted { $0.range.location < $1.range.location }
         var merged: [(range: NSRange, page: Int)] = []
         for entry in sorted {
             if let last = merged.last {
                 let lastEnd = last.range.location + last.range.length
-                if entry.range.location <= lastEnd + 60 {
+                if entry.range.location <= lastEnd + mergeGap {
                     merged[merged.count - 1].range.length = max(lastEnd, entry.range.location + entry.range.length) - last.range.location
                 } else {
                     merged.append(entry)

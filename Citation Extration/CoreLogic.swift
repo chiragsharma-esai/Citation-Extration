@@ -805,15 +805,44 @@ enum CitationScanner {
             let startPage = pageNumberAt(offset: snapped.location, in: ns, pageMarkerPositions: pageMarkers)
             let endPage = pageNumberAt(offset: lastOffset, in: ns, pageMarkerPositions: pageMarkers)
 
-            // Convert internal markers into a VISIBLE inline label instead of
-            // deleting them, so the model can see exactly where the new page begins
-            // and attribute each case to the right side of the break.
-            let markerPattern = "<<<PAGE_(\\d+)>>>\\n?"
+            // Convert internal markers into a VISIBLE label instead of deleting
+            // them, so the model can see exactly where the new page begins and
+            // attribute each case to the right side of the break.
+            //
+            // How the label is placed matters. A page break regularly falls in the
+            // middle of a case name — page 25 ending "...in Commissioner of Income
+            // Tax" and page 26 opening "v. Ashok Kumar Poddar 2023 SCC OnLine Cal
+            // 6527". Putting the label on its own line there reads as a paragraph
+            // break and invites the model to emit two cases instead of one. So the
+            // label goes inline when the sentence is still running, and on its own
+            // line only when the previous sentence actually finished.
+            let markerPattern = "\\n*<<<PAGE_(\\d+)>>>\\n*"
             if let regex = try? NSRegularExpression(pattern: markerPattern) {
-                passage = regex.stringByReplacingMatches(
-                    in: passage,
-                    range: NSRange(location: 0, length: (passage as NSString).length),
-                    withTemplate: "\n[Page $1]\n")
+                let ns = passage as NSString
+                var rebuilt = ""
+                var cursor = 0
+                for m in regex.matches(in: passage, range: NSRange(location: 0, length: ns.length)) {
+                    rebuilt += ns.substring(with: NSRange(location: cursor, length: m.range.location - cursor))
+                    let page = ns.substring(with: m.range(at: 1))
+                    let tail = rebuilt.trimmingCharacters(in: .whitespacesAndNewlines)
+                    var sentenceEnded = true
+                    if let lastChar = tail.last {
+                        if ".!?:;\"”'’".contains(lastChar) {
+                            // A trailing period often belongs to an abbreviation
+                            // rather than a sentence — and the break frequently
+                            // lands exactly on one, as in "... (Dr) v." | "Union of
+                            // India". Treat a short final token as a continuation.
+                            let lastToken = tail.split(separator: " ").last.map(String.init) ?? ""
+                            sentenceEnded = !(lastChar == "." && lastToken.count <= 4)
+                        } else {
+                            sentenceEnded = false
+                        }
+                    }
+                    rebuilt += sentenceEnded ? "\n\n[Page \(page)]\n" : " [Page \(page)] "
+                    cursor = m.range.location + m.range.length
+                }
+                rebuilt += ns.substring(from: cursor)
+                passage = rebuilt
             }
             passage = passage.trimmingCharacters(in: .whitespacesAndNewlines)
 
@@ -1001,6 +1030,13 @@ class LLMManager: ObservableObject {
        - A case name split across the break (party name before the marker, citation
          after it) belongs to the page where the CASE NAME starts.
        - If genuinely ambiguous, use the first page number visible.
+    8. A page marker NEVER splits a case. Text runs continuously across it, so a
+       name interrupted by one is still ONE case — join the halves and emit a single
+       entry. For example "...in Commissioner of Income Tax [Page 26] v. Ashok Kumar
+       Poddar 2023 SCC OnLine Cal 6527" is the single case "Commissioner of Income
+       Tax v. Ashok Kumar Poddar" with citation "2023 SCC OnLine Cal 6527" on the
+       earlier page — NOT two separate cases. Never take a page marker, a page
+       number or a document reference number as a case's citation.
 
     OUTPUT FORMAT:
     Respond with ONE JSON object and nothing else. Do NOT write markdown fences.

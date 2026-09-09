@@ -694,7 +694,19 @@ enum CitationScanner {
 
     struct AnnotatedPassage {
         let text: String
+        /// Page on which the passage starts.
         let pageNumber: Int
+        /// Page on which the passage ends. Equal to `pageNumber` unless the
+        /// passage straddles a page break.
+        let endPageNumber: Int
+
+        init(text: String, pageNumber: Int, endPageNumber: Int? = nil) {
+            self.text = text
+            self.pageNumber = pageNumber
+            self.endPageNumber = endPageNumber ?? pageNumber
+        }
+
+        var spansPages: Bool { endPageNumber != pageNumber }
     }
 
     private static func pageNumberAt(offset: Int, in text: NSString, pageMarkerPositions: [(offset: Int, page: Int)]) -> Int {
@@ -777,12 +789,38 @@ enum CitationScanner {
             var passage = ns.substring(with: snapped).trimmingCharacters(in: .whitespacesAndNewlines)
             if isPureHeaderPassage(passage) { return nil }
             if passage.isEmpty { return nil }
-            // Strip internal page markers from passage text for cleaner LLM input
-            let markerPattern = "<<<PAGE_\\d+>>>\\n?"
+
+            // Derive the page span from the passage's own offsets rather than from
+            // the first match that seeded it. A merged window may legitimately
+            // straddle a page break — "X (Dr) v." can end page 6 while
+            // "Union of India, (1994) 6 SCC 360" opens page 7 — and splitting there
+            // would orphan the respondent and the citation from the party name.
+            let lastOffset = max(snapped.location, snapped.location + snapped.length - 1)
+            let startPage = pageNumberAt(offset: snapped.location, in: ns, pageMarkerPositions: pageMarkers)
+            let endPage = pageNumberAt(offset: lastOffset, in: ns, pageMarkerPositions: pageMarkers)
+
+            // Convert internal markers into a VISIBLE inline label instead of
+            // deleting them, so the model can see exactly where the new page begins
+            // and attribute each case to the right side of the break.
+            let markerPattern = "<<<PAGE_(\\d+)>>>\\n?"
             if let regex = try? NSRegularExpression(pattern: markerPattern) {
-                passage = regex.stringByReplacingMatches(in: passage, range: NSRange(location: 0, length: (passage as NSString).length), withTemplate: "")
+                passage = regex.stringByReplacingMatches(
+                    in: passage,
+                    range: NSRange(location: 0, length: (passage as NSString).length),
+                    withTemplate: "\n[Page $1]\n")
             }
-            return AnnotatedPassage(text: passage, pageNumber: entry.page)
+            passage = passage.trimmingCharacters(in: .whitespacesAndNewlines)
+
+            // A passage starting at the top of a page would otherwise repeat itself:
+            // "[Page 4 excerpt]:" followed immediately by an inline "[Page 4]".
+            let redundantPrefix = "[Page \(startPage)]"
+            if passage.hasPrefix(redundantPrefix) {
+                passage = String(passage.dropFirst(redundantPrefix.count))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            guard !passage.isEmpty else { return nil }
+
+            return AnnotatedPassage(text: passage, pageNumber: startPage, endPageNumber: endPage)
         }
 
         guard !passages.isEmpty else { return nil }
@@ -805,8 +843,13 @@ enum CitationScanner {
     }
 
     static func formatAnnotatedPassages(_ passages: [AnnotatedPassage]) -> String {
-        passages.map { "[Page \($0.pageNumber) excerpt]:\n\($0.text)" }
-            .joined(separator: "\n\n[…]\n\n")
+        passages.map { passage in
+            let header = passage.spansPages
+                ? "[Page \(passage.pageNumber)-\(passage.endPageNumber) excerpt]"
+                : "[Page \(passage.pageNumber) excerpt]"
+            return "\(header):\n\(passage.text)"
+        }
+        .joined(separator: "\n\n[…]\n\n")
     }
 }
 
@@ -944,7 +987,14 @@ class LLMManager: ObservableObject {
     4. Missing Data: If a detail is missing, return null. Do not hallucinate.
     5. No Repeats: Emit each unique case only once.
     6. NEVER extract footnote numbers or naked years as case names. Combine them into the citation field.
-    7. Page Number: If the text is annotated with [Page N excerpt], set pageNumber to N. If the text has [Page N]: markers, use those. If ambiguous, use the first page number visible.
+    7. Page Number: Set pageNumber from the page annotations in the text.
+       - "[Page N excerpt]" means everything under it is on page N.
+       - "[Page A-B excerpt]" means the passage crosses a page break. Inside it, an
+         inline "[Page B]" marks exactly where page B begins. Cases appearing BEFORE
+         that inline marker are on page A; cases appearing AFTER it are on page B.
+       - A case name split across the break (party name before the marker, citation
+         after it) belongs to the page where the CASE NAME starts.
+       - If genuinely ambiguous, use the first page number visible.
 
     OUTPUT FORMAT:
     Respond with ONE JSON object and nothing else. Do NOT write markdown fences.

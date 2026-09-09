@@ -38,9 +38,13 @@ struct CitedCase: Codable, Identifiable, Hashable {
     let court: String?
     let context: String?
     let pageNumber: Int?
+    /// True for the document's own case, which is surfaced as the first row so the
+    /// reader can see what was identified as self-reference rather than silently
+    /// dropped. The model never emits this field; it is set when we build the row.
+    let isSelfReference: Bool
 
     private enum CodingKeys: String, CodingKey {
-        case caseName, citation, year, court, context, pageNumber
+        case caseName, citation, year, court, context, pageNumber, isSelfReference
     }
 
     init(from decoder: Swift.Decoder) throws {
@@ -51,15 +55,17 @@ struct CitedCase: Codable, Identifiable, Hashable {
         context = Self.decodeLenientString(container, .context)
         year = Self.decodeLenientInt(container, .year)
         pageNumber = Self.decodeLenientInt(container, .pageNumber)
+        isSelfReference = (try? container.decode(Bool.self, forKey: .isSelfReference)) ?? false
     }
 
-    init(caseName: String, citation: String?, year: Int?, court: String?, context: String?, pageNumber: Int? = nil) {
+    init(caseName: String, citation: String?, year: Int?, court: String?, context: String?, pageNumber: Int? = nil, isSelfReference: Bool = false) {
         self.caseName = caseName
         self.citation = citation
         self.year = year
         self.court = court
         self.context = context
         self.pageNumber = pageNumber
+        self.isSelfReference = isSelfReference
     }
 
     private static func decodeLenientString(_ container: KeyedDecodingContainer<CodingKeys>, _ key: CodingKeys) -> String? {
@@ -1251,14 +1257,19 @@ class LLMManager: ObservableObject {
             mergedResult = Self.mergeChunkOutputs(chunkOutputs)
         }
 
-        // Safety-net: filter self-references from final output
-        if selfRef.caseTitle != nil,
-           let parsed = DocumentExtractionResult.parse(from: mergedResult) {
-            let filtered = Self.filterSelfReferences(parsed.citedCases, selfRef: selfRef)
-            if filtered.count < parsed.citedCases.count {
-                print("🧹 [SELF-REF FILTER] Removed \(parsed.citedCases.count - filtered.count) self-reference(s) from output")
+        // Remove the model's own attempts at the self-reference, then surface it
+        // once at the top as an explicitly marked row. Showing it beats hiding it:
+        // the reader can confirm the document was identified correctly, and sees
+        // why that case is absent from the cited list.
+        if let parsed = DocumentExtractionResult.parse(from: mergedResult) {
+            var finalCases = Self.filterSelfReferences(parsed.citedCases, selfRef: selfRef)
+            if finalCases.count < parsed.citedCases.count {
+                print("🧹 [SELF-REF FILTER] Removed \(parsed.citedCases.count - finalCases.count) duplicate self-reference(s) from the cited list")
             }
-            let result = DocumentExtractionResult(citedCases: filtered)
+            if let selfRow = Self.makeSelfReferenceRow(selfRef) {
+                finalCases.insert(selfRow, at: 0)
+            }
+            let result = DocumentExtractionResult(citedCases: finalCases)
             if let data = try? JSONEncoder().encode(result), let json = String(data: data, encoding: .utf8) {
                 mergedResult = json
             }
@@ -1360,6 +1371,26 @@ class LLMManager: ObservableObject {
         }
 
         return keys
+    }
+
+    /// Builds the row representing the document's own case. Returns nil when the
+    /// self-reference could not be identified, in which case the table simply has
+    /// no such row rather than a misleading placeholder.
+    private static func makeSelfReferenceRow(_ selfRef: DocumentSelfReference) -> CitedCase? {
+        // Prefer the title as the name; fall back to the number so a document whose
+        // title could not be read is still represented.
+        guard let name = selfRef.caseTitle ?? selfRef.caseNumber else { return nil }
+        let citation = (selfRef.caseTitle != nil) ? selfRef.caseNumber : nil
+
+        return CitedCase(
+            caseName: name,
+            citation: citation,
+            year: nil,
+            court: nil,
+            context: "This document's own case — not a cited precedent.",
+            pageNumber: 1,
+            isSelfReference: true
+        )
     }
 
     private static func filterSelfReferences(_ cases: [CitedCase], selfRef: DocumentSelfReference) -> [CitedCase] {

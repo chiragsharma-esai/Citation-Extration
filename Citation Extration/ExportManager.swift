@@ -18,9 +18,12 @@ class ExportManager {
 
         guard savePanel.runModal() == .OK, let url = savePanel.url else { return }
 
-        var rows = ["Case Name,Citation,Year,Court,Context,Page Number"]
+        // "Type" carries the distinction the table shows with colour, since a CSV
+        // cannot.
+        var rows = ["Type,Case Name,Citation,Year,Court,Context,Page Number"]
         for c in citedCases {
             let row = [
+                c.isSelfReference ? "This Document" : "Cited",
                 csvEscape(c.caseName),
                 csvEscape(c.citation ?? ""),
                 c.year.map(String.init) ?? "",

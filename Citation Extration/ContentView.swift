@@ -176,9 +176,21 @@ struct ContentView: View {
                 }
 
                 if !parsedCases.isEmpty {
-                    Text("\(parsedCases.count) citation\(parsedCases.count == 1 ? "" : "s") found")
+                    let citedCount = parsedCases.filter { !$0.isSelfReference }.count
+                    Text("\(citedCount) cited case\(citedCount == 1 ? "" : "s") found")
                         .font(.caption)
                         .foregroundColor(.secondary)
+
+                    if parsedCases.contains(where: { $0.isSelfReference }) {
+                        HStack(spacing: 4) {
+                            Circle()
+                                .fill(Color.accentColor)
+                                .frame(width: 6, height: 6)
+                            Text("first row is this document's own case")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
                 }
 
                 Spacer()
@@ -240,11 +252,26 @@ struct ContentView: View {
         } else {
             Table(parsedCases, selection: $selectedCaseID) {
                 TableColumn("Party Names") { c in
-                    Text(c.caseName)
-                        .lineLimit(2)
-                        .help(c.caseName)
+                    HStack(spacing: 6) {
+                        if c.isSelfReference {
+                            Text("THIS DOCUMENT")
+                                .font(.system(size: 9, weight: .bold))
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 2)
+                                .background(Capsule().fill(Color.accentColor.opacity(0.18)))
+                                .foregroundColor(.accentColor)
+                                .fixedSize()
+                        }
+                        Text(c.caseName)
+                            .lineLimit(2)
+                            .foregroundColor(c.isSelfReference ? .accentColor : .primary)
+                            .fontWeight(c.isSelfReference ? .semibold : .regular)
+                    }
+                    .help(c.isSelfReference
+                          ? "This is the document's own case, not a cited precedent"
+                          : c.caseName)
                 }
-                .width(min: 160, ideal: 200)
+                .width(min: 160, ideal: 220)
 
                 TableColumn("Citation") { c in
                     Text(c.citation ?? "N/A")

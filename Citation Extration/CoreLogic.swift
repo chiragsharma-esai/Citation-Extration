@@ -1142,7 +1142,7 @@ class LLMManager: ObservableObject {
 
         let totalStartTime = CFAbsoluteTimeGetCurrent()
 
-        let batches = Self.chunkByPages(pdfText)
+        let batches = Self.chunkByPages(Self.stripRunningHeaders(pdfText))
         let isSingleBatch = batches.count == 1
 
         // Self-reference extraction from first batch
@@ -1328,16 +1328,60 @@ class LLMManager: ObservableObject {
         return selfRef
     }
 
-    private static func filterSelfReferences(_ cases: [CitedCase], selfRef: DocumentSelfReference) -> [CitedCase] {
-        guard let selfTitle = selfRef.caseTitle else { return cases }
-        let selfTokens = nameTokens(selfTitle)
-        guard !selfTokens.isEmpty else { return cases }
+    /// Pulls the individual case identifiers out of a possibly compound reference.
+    ///
+    /// A document's own number is regularly a compound of several matters —
+    /// "W.P.(C) 16754/2025 & CM APPL. 68768/2025" — so comparing the whole string
+    /// never matches a document that cites just one half of it. Reducing both sides
+    /// to a set of canonical identifiers makes the comparison work either way.
+    ///
+    /// Recognises the two forms used across Indian courts: a docket number/year
+    /// ("16754/2025", "645 of 2020") and a neutral citation ("2025:DHC:10505",
+    /// "2024 INSC 893"). No court, format or document is hard-coded.
+    private static func caseNumberKeys(_ raw: String?) -> Set<String> {
+        guard let raw, !raw.isEmpty else { return [] }
+        let ns = raw as NSString
+        let full = NSRange(location: 0, length: ns.length)
+        var keys = Set<String>()
 
-        let selfNumberKey: String? = selfRef.caseNumber.map { $0.lowercased().filter { $0.isLetter || $0.isNumber } }
+        if let re = try? NSRegularExpression(pattern: "(\\d{1,7})\\s*(?:/|\\s+of\\s+)\\s*((?:19|20)\\d{2})") {
+            for m in re.matches(in: raw, range: full) where m.numberOfRanges == 3 {
+                keys.insert("\(ns.substring(with: m.range(at: 1)))/\(ns.substring(with: m.range(at: 2)))")
+            }
+        }
+
+        if let re = try? NSRegularExpression(pattern: "((?:19|20)\\d{2})\\s*[:\\s]\\s*([A-Za-z]{2,10})\\s*[:\\s]\\s*(\\d{1,6})") {
+            for m in re.matches(in: raw, range: full) where m.numberOfRanges == 4 {
+                let year = ns.substring(with: m.range(at: 1))
+                let court = ns.substring(with: m.range(at: 2)).uppercased()
+                let num = ns.substring(with: m.range(at: 3))
+                keys.insert("\(year):\(court):\(num)")
+            }
+        }
+
+        return keys
+    }
+
+    private static func filterSelfReferences(_ cases: [CitedCase], selfRef: DocumentSelfReference) -> [CitedCase] {
+        let selfTokens = selfRef.caseTitle.map(nameTokens) ?? []
+        let selfNumberKeys = caseNumberKeys(selfRef.caseNumber)
+
+        // Either signal alone is enough; a title that reduces to nothing but noise
+        // words should not disable number matching as well.
+        guard !selfTokens.isEmpty || !selfNumberKeys.isEmpty else { return cases }
 
         return cases.filter { c in
+            // Identifier match. Check the name too, because a self-reference is often
+            // emitted under its docket number rather than its party names.
+            if !selfNumberKeys.isEmpty {
+                let candidateKeys = caseNumberKeys(c.citation).union(caseNumberKeys(c.caseName))
+                if !candidateKeys.isDisjoint(with: selfNumberKeys) { return false }
+            }
+
+            guard !selfTokens.isEmpty else { return true }
             let caseTokens = nameTokens(c.caseName)
             guard !caseTokens.isEmpty else { return true }
+
             let intersection = selfTokens.intersection(caseTokens)
             let jaccard = Double(intersection.count) / Double(selfTokens.union(caseTokens).count)
             if jaccard > 0.7 { return false }
@@ -1349,10 +1393,6 @@ class LLMManager: ObservableObject {
             let minCount = min(selfTokens.count, caseTokens.count)
             if minCount >= 2 && intersection.count == minCount { return false }
 
-            if let selfNum = selfNumberKey, let citNum = c.citation {
-                let citKey = citNum.lowercased().filter { $0.isLetter || $0.isNumber }
-                if !citKey.isEmpty && citKey == selfNum { return false }
-            }
             return true
         }
     }
@@ -1416,6 +1456,71 @@ class LLMManager: ObservableObject {
 
     static let internalPageMarker = "<<<PAGE_"
     static let internalPageMarkerSuffix = ">>>"
+
+    /// Removes running headers and footers — the page furniture that repeats on
+    /// nearly every page.
+    ///
+    /// This matters beyond tidiness: a court document's furniture almost always
+    /// carries its OWN docket number ("W.P.(C) 16754/2025  Page 4 of 39"). The
+    /// citation scanner sees a docket-shaped string on every single page, so no
+    /// page can ever be skipped, and each one hands the model the document's own
+    /// identity as if it were a cited precedent. Stripping the furniture removes
+    /// that pressure at the source instead of relying on the self-reference
+    /// filter to clean it up afterwards.
+    ///
+    /// Detection is structural rather than pattern-based: digit runs are collapsed
+    /// so "Page 4 of 39" and "Page 5 of 39" count as the same line, and any line
+    /// present on most pages is treated as furniture. Nothing about a particular
+    /// court, format or document is hard-coded.
+    static func stripRunningHeaders(_ text: String) -> String {
+        let pages = text.components(separatedBy: PDFParser.pageBreakMarker)
+
+        // Too few pages to tell furniture apart from content that merely recurs.
+        guard pages.count >= 4 else { return text }
+
+        func normalized(_ line: String) -> String {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return "" }
+            var out = ""
+            var inDigits = false
+            for ch in trimmed {
+                if ch.isNumber {
+                    if !inDigits { out.append("#"); inDigits = true }
+                } else {
+                    out.append(ch)
+                    inDigits = false
+                }
+            }
+            return out
+        }
+
+        // Count the number of PAGES a normalized line appears on, not total
+        // occurrences, so a line repeated many times on one page cannot qualify.
+        var pageCount: [String: Int] = [:]
+        for page in pages {
+            var seen = Set<String>()
+            for line in page.components(separatedBy: .newlines) {
+                let key = normalized(line)
+                if !key.isEmpty { seen.insert(key) }
+            }
+            for key in seen { pageCount[key, default: 0] += 1 }
+        }
+
+        // 60% is deliberately conservative: genuine body text does not recur on
+        // three fifths of a judgment's pages, while furniture appears on all of them.
+        let threshold = Int((Double(pages.count) * 0.6).rounded())
+        let furniture = Set(pageCount.filter { $0.value >= threshold }.keys)
+        guard !furniture.isEmpty else { return text }
+
+        let cleanedPages = pages.map { page -> String in
+            page.components(separatedBy: .newlines)
+                .filter { !furniture.contains(normalized($0)) }
+                .joined(separator: "\n")
+        }
+
+        print("🧽 [BOILERPLATE] Removed \(furniture.count) running header/footer line(s) present on ≥\(threshold)/\(pages.count) pages")
+        return cleanedPages.joined(separator: PDFParser.pageBreakMarker)
+    }
 
     private static func chunkByPages(_ text: String, pagesPerBatch: Int = 2) -> [PageBatch] {
         let pages = text.components(separatedBy: PDFParser.pageBreakMarker)

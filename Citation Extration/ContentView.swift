@@ -233,13 +233,23 @@ struct ContentView: View {
                 highlightPage = nil
                 return
             }
-            highlightText = citedCase.caseName
+            
+            // CITATION HIGHLIGHT LOGIC:
+            // Prioritize highlighting the citation (e.g., "2007 1 SSC 789") in the document viewer.
+            // Fall back to the case party name only if the citation is unavailable or marked as "N/A".
+            let cleanCitation = citedCase.citation?.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let cleanCitation, !cleanCitation.isEmpty && cleanCitation.uppercased() != "N/A" {
+                highlightText = cleanCitation
+            } else {
+                highlightText = citedCase.caseName
+            }
+
             highlightCitation = citedCase.citation
             highlightPage = citedCase.pageNumber
         }
     }
 
-    // MARK: - Citation Table
+    // MARK: - Citation Table (Citation First, Party Names Second)
     @ViewBuilder
     private var citationTableView: some View {
         if parsedCases.isEmpty {
@@ -251,7 +261,8 @@ struct ContentView: View {
             }
         } else {
             Table(parsedCases, selection: $selectedCaseID) {
-                TableColumn("Party Names") { c in
+                // 1. Citation Column (Displayed first, includes "THIS DOCUMENT" badge for self-reference)
+                TableColumn("Citation") { c in
                     HStack(spacing: 6) {
                         if c.isSelfReference {
                             Text("THIS DOCUMENT")
@@ -262,24 +273,27 @@ struct ContentView: View {
                                 .foregroundColor(.accentColor)
                                 .fixedSize()
                         }
-                        Text(c.caseName)
-                            .lineLimit(2)
-                            .foregroundColor(c.isSelfReference ? .accentColor : .primary)
+                        Text(c.citation ?? "N/A")
+                            .foregroundColor(c.citation != nil ? (c.isSelfReference ? .accentColor : .primary) : .secondary)
                             .fontWeight(c.isSelfReference ? .semibold : .regular)
+                            .lineLimit(1)
                     }
-                    .help(c.isSelfReference
-                          ? "This is the document's own case, not a cited precedent"
-                          : c.caseName)
+                }
+                .width(min: 140, ideal: 200)
+
+                // 2. Party Names Column (Displayed second)
+                TableColumn("Party Names") { c in
+                    Text(c.caseName)
+                        .lineLimit(2)
+                        .foregroundColor(c.isSelfReference ? .accentColor : .primary)
+                        .fontWeight(c.isSelfReference ? .semibold : .regular)
+                        .help(c.isSelfReference
+                              ? "This is the document's own case, not a cited precedent"
+                              : c.caseName)
                 }
                 .width(min: 160, ideal: 220)
 
-                TableColumn("Citation") { c in
-                    Text(c.citation ?? "N/A")
-                        .foregroundColor(c.citation != nil ? .primary : .secondary)
-                        .lineLimit(1)
-                }
-                .width(min: 120, ideal: 160)
-
+                // 3. Court Column
                 TableColumn("Court") { c in
                     Text(c.court ?? "—")
                         .foregroundColor(c.court != nil ? .primary : .secondary)
@@ -287,6 +301,7 @@ struct ContentView: View {
                 }
                 .width(min: 70, ideal: 90)
 
+                // 4. Context Column
                 TableColumn("Context") { c in
                     Text(c.context ?? "—")
                         .foregroundColor(c.context != nil ? .primary : .secondary)
@@ -295,6 +310,7 @@ struct ContentView: View {
                 }
                 .width(min: 140, ideal: 180)
 
+                // 5. Page Column
                 TableColumn("Page") { c in
                     Text(c.pageNumber.map(String.init) ?? "—")
                         .monospacedDigit()

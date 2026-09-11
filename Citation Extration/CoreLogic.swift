@@ -30,10 +30,8 @@ struct ChatHistory: Identifiable, Hashable {
 }
 
 // MARK: - Structured Extraction Schema
+// MARK: - Structured Extraction Schema
 struct CitedCase: Codable, Identifiable, Hashable {
-    /// Identity is per-row, not per-content. Repeated citations are kept now that
-    /// deduplication is gone, so two rows can be identical in every field; a
-    /// content-derived id would collide and break Table selection. Not encoded.
     let id = UUID()
     let caseName: String
     let citation: String?
@@ -41,13 +39,11 @@ struct CitedCase: Codable, Identifiable, Hashable {
     let court: String?
     let context: String?
     let pageNumber: Int?
-    /// True for the document's own case, which is surfaced as the first row so the
-    /// reader can see what was identified as self-reference rather than silently
-    /// dropped. The model never emits this field; it is set when we build the row.
     let isSelfReference: Bool
+    let pdfHighlightText: String?   // raw text span used for PDF search/highlight
 
     private enum CodingKeys: String, CodingKey {
-        case caseName, citation, year, court, context, pageNumber, isSelfReference
+        case caseName, citation, year, court, context, pageNumber, isSelfReference, pdfHighlightText
     }
 
     init(from decoder: Swift.Decoder) throws {
@@ -59,9 +55,10 @@ struct CitedCase: Codable, Identifiable, Hashable {
         year = Self.decodeLenientInt(container, .year)
         pageNumber = Self.decodeLenientInt(container, .pageNumber)
         isSelfReference = (try? container.decode(Bool.self, forKey: .isSelfReference)) ?? false
+        pdfHighlightText = Self.decodeLenientString(container, .pdfHighlightText)
     }
 
-    init(caseName: String, citation: String?, year: Int?, court: String?, context: String?, pageNumber: Int? = nil, isSelfReference: Bool = false) {
+    init(caseName: String, citation: String?, year: Int?, court: String?, context: String?, pageNumber: Int? = nil, isSelfReference: Bool = false, pdfHighlightText: String? = nil) {
         self.caseName = caseName
         self.citation = citation
         self.year = year
@@ -69,6 +66,7 @@ struct CitedCase: Codable, Identifiable, Hashable {
         self.context = context
         self.pageNumber = pageNumber
         self.isSelfReference = isSelfReference
+        self.pdfHighlightText = pdfHighlightText ?? citation
     }
 
     private static func decodeLenientString(_ container: KeyedDecodingContainer<CodingKeys>, _ key: CodingKeys) -> String? {
@@ -109,18 +107,12 @@ struct DocumentExtractionResult: Codable {
             text = String(text[..<fenceEnd.lowerBound])
         }
 
-        // Small models often echo the schema (`type DocumentExtractionResult = {...}`)
-        // before emitting the real object, so locate the object that actually
-        // carries a `citedCases` ARRAY rather than trusting the first brace.
         if let candidate = extractDataObject(from: text) {
-            // Attempt 1: as-is.
             if let data = candidate.data(using: .utf8),
                let decoded = try? JSONDecoder().decode(DocumentExtractionResult.self, from: data) {
                 return decoded
             }
 
-            // Attempt 2: models sometimes emit TypeScript object-literal syntax
-            // with unquoted keys — quote them and retry.
             let quoted = quoteBareKeys(candidate)
             if let data = quoted.data(using: .utf8),
                let decoded = try? JSONDecoder().decode(DocumentExtractionResult.self, from: data) {
@@ -128,7 +120,6 @@ struct DocumentExtractionResult: Codable {
             }
         }
 
-        // Attempt 3: the model dropped the wrapper and emitted a bare array.
         if let arrayText = extractBareArray(from: text) {
             for variant in [arrayText, quoteBareKeys(arrayText)] {
                 if let data = variant.data(using: .utf8),
@@ -141,8 +132,6 @@ struct DocumentExtractionResult: Codable {
         return nil
     }
 
-    /// Extracts a top-level `[...]` array, used when the model omits the
-    /// `citedCases` wrapper object entirely.
     private static func extractBareArray(from text: String) -> String? {
         let chars = Array(text)
         guard let start = chars.firstIndex(of: "[") else { return nil }
@@ -169,12 +158,9 @@ struct DocumentExtractionResult: Codable {
         return nil
     }
 
-    /// Finds the JSON object containing a `citedCases` array, brace-matching from
-    /// its opening brace and repairing unclosed brackets if generation was truncated.
     private static func extractDataObject(from text: String) -> String? {
         let chars = Array(text)
 
-        // Locate a `citedCases` key whose value opens an array.
         var keyIndex: Int? = nil
         let needle = Array("citedCases")
         var i = 0
@@ -195,12 +181,10 @@ struct DocumentExtractionResult: Codable {
         }
         guard let foundKey = keyIndex else { return nil }
 
-        // Walk back to the brace that opens the enclosing object.
         var start = foundKey
         while start >= 0, chars[start] != "{" { start -= 1 }
         guard start >= 0 else { return nil }
 
-        // Brace/bracket match forward, ignoring delimiters inside string literals.
         var stack: [Character] = []
         var inString = false
         var escaped = false
@@ -232,15 +216,12 @@ struct DocumentExtractionResult: Codable {
             return String(chars[start...end])
         }
 
-        // Truncated output — close whatever is still open.
         var repaired = String(chars[start...])
         if inString { repaired += "\"" }
         while let closer = stack.popLast() { repaired.append(closer) }
         return repaired
     }
 
-    /// Quotes unquoted object keys (TypeScript literal style) without touching
-    /// text inside string values.
     private static func quoteBareKeys(_ json: String) -> String {
         var result = ""
         var inString = false
@@ -348,7 +329,7 @@ enum LLMModel: String, CaseIterable, Identifiable {
 
     var id: String { rawValue }
 
-    var hubRepoID: String?{
+    var hubRepoID: String? {
         switch self {
         case .gemma4: return "mlx-community/gemma-4-e2b-it-4bit"
         case .gemma3n: return "mlx-community/gemma-3n-E2B-it-lm-4bit"
@@ -421,11 +402,7 @@ private struct ManualHubDownloader: MLXLMCommon.Downloader {
 }
 
 private struct ManualTokenizerBridge: MLXLMCommon.Tokenizer {
-    private var upstream: any Tokenizers.Tokenizer {
-        didSet {
-            // Unused but required
-        }
-    }
+    private var upstream: any Tokenizers.Tokenizer { didSet {} }
 
     init(_ upstream: any Tokenizers.Tokenizer) {
         self.upstream = upstream
@@ -473,8 +450,6 @@ private struct ManualTokenizerLoader: MLXLMCommon.TokenizerLoader {
         return ManualTokenizerBridge(upstream)
     }
 }
-
-// OutputFormat removed — always JSON internally
 
 enum ParseStatus: Sendable {
     case notApplicable
@@ -551,13 +526,10 @@ struct ChunkResult: Sendable {
     let thinkingText: String
 }
 
-// MARK: - STEP 1: UNIVERSAL HIGH-PRECISION CITATION SCANNER
+// MARK: - Citation Scanner
 enum CitationScanner {
-    
     static let defaultCharsBefore = 350
     static let defaultCharsAfter = 350
-
-    /// Windows closer together than this are joined into one passage.
     static let mergeGap = 150
 
     private static let reporterTokens: [String] = [
@@ -577,8 +549,7 @@ enum CitationScanner {
         "MahLJ", "AllER", "CutLT", "KerLR", "LILR", "BLR", "VKN", "KLJ",
         "AllCriC", "SCL", "GujLR", "PLR", "JKLR", "GCD", "PLJR", "RLR",
         "GujLH", "OELT", "BLJ", "BomLR", "KerLJ", "MIA", "SCt", "UPLBEC",
-        "SarPCJ", "ACE", "WLR", "CalLT", "MWN", "TAC",
-        "EWHC", "UKSC"
+        "SarPCJ", "ACE", "WLR", "CalLT", "MWN", "TAC", "EWHC", "UKSC"
     ]
 
     private static let neutralTokens: [String] = [
@@ -611,20 +582,17 @@ enum CitationScanner {
             return "(?i:\(pattern))"
         }
 
-        // Standard reporters & neutral citations
         let standardTokens = (reporterTokens + neutralTokens)
             .sorted { ($0.count, $0) > ($1.count, $1) }
             .map(tolerantAcronym)
             .joined(separator: "|")
 
-        // Docket patterns e.g. SLP(C) No. 6092 of 2025, CS(COMM) 583/2025, W.P.(C) 1206/2025
         let docketEscaped = docketTokens
             .sorted { ($0.count, $0) > ($1.count, $1) }
             .map { NSRegularExpression.escapedPattern(for: $0) }
             .joined(separator: "|")
         let docketPattern = "(?i:(?:\(docketEscaped)))\\s*(?:\\(?[A-Za-z]+\\)?\\s*)?(?:No\\.?|Nos\\.?)?\\s*\\d+"
 
-        // Dedicated pattern for SCC OnLine variants: "SCC OnLineBom 1262", "SCC OnLine Del 4029", "SCC Online 2024"
         let sccOnlinePattern = "(?i:SCC\\s*OnLine(?:\\s*[A-Za-z]{2,6})?\\s*\\d+)"
 
         var combinedPatterns: [String] = [
@@ -634,14 +602,6 @@ enum CitationScanner {
         ]
 
         if includePartyMarker {
-            // Party markers: v., vs., versus, In Re:, titled '...'
-            //
-            // The lookbehind must accept more than \w before the separator. Party
-            // names frequently end in a parenthetical, an abbreviation dot or a
-            // quote — e.g. "M Ismail Faruqui (Dr) v. Union of India" or
-            // "State of U.P. (Through Secretary) v. Ram Kumar". Requiring \w there
-            // silently dropped those cases: no match meant no excerpt window, so the
-            // case never reached the model at all.
             let partyPattern = "(?<=[\\w\\)\\]\\.'’\"][\\s\\-,])(?i:v|vs|v/s)\\.?(?=[\\s\\-,;:]|$)|(?i:\\bversus\\b)|(?i:\\bIn\\s+Re:?\\b)|(?i:\\btitled\\s+['\"‘][A-Za-z])"
             combinedPatterns.append(partyPattern)
         }
@@ -652,14 +612,12 @@ enum CitationScanner {
 
     private static func isPureHeaderPassage(_ text: String) -> Bool {
         guard text.count < 350 else { return false }
-        
         let upper = text.uppercased()
         let hasHeaderMarker = (upper.contains("APPELLANT") && upper.contains("RESPONDENT")) ||
                               (upper.contains("PETITIONER") && upper.contains("RESPONDENT")) ||
                               (upper.contains("IN THE SUPREME COURT") || upper.contains("IN THE HIGH COURT"))
 
         let hasJudicialVerb = upper.contains("HELD") || upper.contains("RELIED") || upper.contains("OBSERVED") || upper.contains("CITED") || upper.contains("FOLLOWED")
-
         return hasHeaderMarker && !hasJudicialVerb
     }
 
@@ -672,12 +630,11 @@ enum CitationScanner {
         var start = range.location
         var end = range.location + range.length
         
-        // Snap start backwards to nearest whitespace or newline (up to 40 chars search)
         if start > 0 {
             var searchIdx = start
             while searchIdx > 0 && searchIdx > start - 40 {
                 let char = text.character(at: searchIdx)
-                if char == 10 || char == 32 { // \n or space
+                if char == 10 || char == 32 {
                     start = searchIdx + 1
                     break
                 }
@@ -685,16 +642,15 @@ enum CitationScanner {
             }
         }
         
-        // Snap end forwards to nearest whitespace or newline (up to 40 chars search)
         if end < text.length {
             var searchIdx = end
             while searchIdx < text.length && searchIdx < end + 40 {
                 let char = text.character(at: searchIdx)
-                if char == 10 || char == 32 { // \n or space
+                if char == 10 || char == 32 {
                     end = searchIdx
                     break
                 }
-                searchIdx += 1
+                searchIdx -= 1
             }
         }
         
@@ -703,10 +659,7 @@ enum CitationScanner {
 
     struct AnnotatedPassage {
         let text: String
-        /// Page on which the passage starts.
         let pageNumber: Int
-        /// Page on which the passage ends. Equal to `pageNumber` unless the
-        /// passage straddles a page break.
         let endPageNumber: Int
 
         init(text: String, pageNumber: Int, endPageNumber: Int? = nil) {
@@ -763,7 +716,6 @@ enum CitationScanner {
 
         let pageMarkers = findPageMarkers(in: ns)
 
-        // 1. Expand character windows around each regex hit, tracking page
         var rawEntries: [(range: NSRange, page: Int)] = []
         for match in matches {
             let start = max(0, match.range.location - charsBefore)
@@ -772,10 +724,6 @@ enum CitationScanner {
             rawEntries.append((range: NSRange(location: start, length: end - start), page: page))
         }
 
-        // 2. Merge overlapping / nearby character windows.
-        // Bridging a modest gap keeps a passage readable instead of cutting a
-        // sentence in half with "[…]", which costs the model the context that
-        // explains why a case was cited.
         let sorted = rawEntries.sorted { $0.range.location < $1.range.location }
         var merged: [(range: NSRange, page: Int)] = []
         for entry in sorted {
@@ -791,7 +739,6 @@ enum CitationScanner {
             }
         }
 
-        // 3. Snap to clean word boundaries and extract candidate text passages
         var passages: [AnnotatedPassage] = merged.compactMap { entry in
             let snapped = snapToWordBoundaries(in: ns, range: entry.range)
             guard snapped.length > 0 else { return nil }
@@ -799,26 +746,10 @@ enum CitationScanner {
             if isPureHeaderPassage(passage) { return nil }
             if passage.isEmpty { return nil }
 
-            // Derive the page span from the passage's own offsets rather than from
-            // the first match that seeded it. A merged window may legitimately
-            // straddle a page break — "X (Dr) v." can end page 6 while
-            // "Union of India, (1994) 6 SCC 360" opens page 7 — and splitting there
-            // would orphan the respondent and the citation from the party name.
             let lastOffset = max(snapped.location, snapped.location + snapped.length - 1)
             let startPage = pageNumberAt(offset: snapped.location, in: ns, pageMarkerPositions: pageMarkers)
             let endPage = pageNumberAt(offset: lastOffset, in: ns, pageMarkerPositions: pageMarkers)
 
-            // Convert internal markers into a VISIBLE label instead of deleting
-            // them, so the model can see exactly where the new page begins and
-            // attribute each case to the right side of the break.
-            //
-            // How the label is placed matters. A page break regularly falls in the
-            // middle of a case name — page 25 ending "...in Commissioner of Income
-            // Tax" and page 26 opening "v. Ashok Kumar Poddar 2023 SCC OnLine Cal
-            // 6527". Putting the label on its own line there reads as a paragraph
-            // break and invites the model to emit two cases instead of one. So the
-            // label goes inline when the sentence is still running, and on its own
-            // line only when the previous sentence actually finished.
             let markerPattern = "\\n*<<<PAGE_(\\d+)>>>\\n*"
             if let regex = try? NSRegularExpression(pattern: markerPattern) {
                 let ns = passage as NSString
@@ -831,10 +762,6 @@ enum CitationScanner {
                     var sentenceEnded = true
                     if let lastChar = tail.last {
                         if ".!?:;\"”'’".contains(lastChar) {
-                            // A trailing period often belongs to an abbreviation
-                            // rather than a sentence — and the break frequently
-                            // lands exactly on one, as in "... (Dr) v." | "Union of
-                            // India". Treat a short final token as a continuation.
                             let lastToken = tail.split(separator: " ").last.map(String.init) ?? ""
                             sentenceEnded = !(lastChar == "." && lastToken.count <= 4)
                         } else {
@@ -849,8 +776,6 @@ enum CitationScanner {
             }
             passage = passage.trimmingCharacters(in: .whitespacesAndNewlines)
 
-            // A passage starting at the top of a page would otherwise repeat itself:
-            // "[Page 4 excerpt]:" followed immediately by an inline "[Page 4]".
             let redundantPrefix = "[Page \(startPage)]"
             if passage.hasPrefix(redundantPrefix) {
                 passage = String(passage.dropFirst(redundantPrefix.count))
@@ -863,7 +788,6 @@ enum CitationScanner {
 
         guard !passages.isEmpty else { return nil }
 
-        // 4. Preserve Footnote block at the end of the batch
         let lines = text.components(separatedBy: .newlines)
         let footnoteLines = lines.filter { line in
             let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -891,8 +815,7 @@ enum CitationScanner {
     }
 }
 
-
-// MARK: - HIGH-PRECISION STREAM ROUTER
+// MARK: - Stream Parser
 class StreamingReasoningParser {
     enum State {
         case preThinking
@@ -927,7 +850,6 @@ class StreamingReasoningParser {
                     state = .thinking
                     buffer = String(buffer[startRange.upperBound...])
                 } else if buffer.count > 300 {
-                    // Model didn't produce thinking delimiters — treat everything as normal output
                     state = .normal
                     onNormal(buffer)
                     buffer = ""
@@ -1019,57 +941,52 @@ class LLMManager: ObservableObject {
     Your task is to carefully read through Indian court filing documents and extract EVERY legal case named in them — whether relied on as authority, distinguished, overruled, quoted, or merely discussed while checking whether a citation is genuine.
 
     Follow these strict guidelines:
-    1. Identify Case Names: Look for standard adversarial formats (e.g., "X v. Y", "X vs. Y", "In Re: X").
-    2. Identify Citations: Look for standard Indian legal reporters (SCC, AIR, SCR, SCALE, JT, SCC OnLine, Neutral citations).
-    3. Context: Briefly summarize the legal principle or reason why the case was cited(if any).
-    4. Missing Data: If a detail is missing, return null. Do not hallucinate.
-    5. Repeats: If the same case is cited more than once for different points, emit it
-       once per occurrence, each with its own context and page number. Do not merge them.
-    6. NEVER extract footnote numbers or naked years as case names. Combine them into the citation field.
-    7. Page Number: Set pageNumber from the page annotations in the text.
+    1. Identify Case Names (STRICT SEPARATION):
+       - Look for standard adversarial formats (e.g., "X v. Y", "X vs. Y", "In Re: X"). Clean out trailing footnote numbers.
+       - The "caseName" field MUST ONLY contain the names of the parties. NEVER include the citation, volume, year, court name, or page numbers inside caseName.
+
+    2. Identify Citations (EXACT VERBATIM & STRICT SEPARATION): 
+       - The "citation" field MUST ONLY contain the reporter reference (e.g., "2010 (251) ELT 348 (Mad.)", "(1996) 10 SCC 413", "2025 SCC OnLineBom 1262").
+       - NEVER include party names, "v.", or bullet symbols inside the "citation" field.
+       - Always copy the EXACT characters, brackets, and spelling as they appear in the original text without moving parentheses.
+
+    3. BULLETED & NUMBERED LISTS (CRITICAL):
+       - Court judgments often list cited authorities in bullet points (•) or numbered lists (1, 2, 3...).
+       - You MUST extract EVERY SINGLE bullet point without exception. If there are 3 consecutive bullets, you MUST output all 3 cases. Do NOT stop after extracting only 1 or 2.
+
+    4. RECENT PRECEDENTS (2024 / 2025 / 2026):
+       - If a cited case has a recent citation (such as "2025 SCC OnLineBom 1262" or "2024 INSC 500"), it IS a genuine cited precedent and MUST be extracted.
+       - Only exclude the current document's own filing number (e.g., W.P.(C) 16754/2025). Do NOT ignore cited authorities just because they are from recent years.
+
+    5. Context: Briefly summarize the legal principle or reason why the case was cited (if any).
+    6. Missing Data: If a detail is missing, return null. Do not hallucinate.
+    7. Repeats: If the same case is cited more than once for different points, emit it once per occurrence, each with its own context and page number. Do not merge them.
+    
+    8. FOOTNOTES & SUPERSCRIPTS (CRITICAL):
+       - Numbers immediately following a case name (e.g. "Kesavananda Bharati v. State of Kerala¹" or "S R Bommai vs Union of India 2") are FOOTNOTE MARKERS, NOT citations.
+       - NEVER output a bare number (such as "1", "2", "3", "4") in the "citation" field.
+       - Whenever a case refers to a footnote marker, check the "FOOTNOTES FOR THIS PAGE" block at the bottom of the excerpt.
+       - Look up the matching footnote number (e.g. "2 (1994) 3 SCC 1 (9 Judges)") and use the real legal reporter citation in the "citation" field, and set the "year".
+
+    9. Page Number: Set pageNumber from the page annotations in the text.
        - "[Page N excerpt]" means everything under it is on page N.
-       - "[Page A-B excerpt]" means the passage crosses a page break. Inside it, an
-         inline "[Page B]" marks exactly where page B begins. Cases appearing BEFORE
-         that inline marker are on page A; cases appearing AFTER it are on page B.
-       - A case name split across the break (party name before the marker, citation
-         after it) belongs to the page where the CASE NAME starts.
+       - "[Page A-B excerpt]" means the passage crosses a page break. Inside it, an inline "[Page B]" marks exactly where page B begins.
+       - A case name split across the break belongs to the page where the CASE NAME starts.
        - If genuinely ambiguous, use the first page number visible.
-    8. A page marker NEVER splits a case. Text runs continuously across it, so a
-       name interrupted by one is still ONE case — join the halves and emit a single
-       entry. For example "...in Commissioner of Income Tax [Page 26] v. Ashok Kumar
-       Poddar 2023 SCC OnLine Cal 6527" is the single case "Commissioner of Income
-       Tax v. Ashok Kumar Poddar" with citation "2023 SCC OnLine Cal 6527" on the
-       earlier page — NOT two separate cases. Never take a page marker, a page
-       number or a document reference number as a case's citation.
+
+    10. Continuous Text: A page marker NEVER splits a case. Text runs continuously across it, so join the halves into a single entry. Never take a page marker, page number or filing number as a precedent's citation.
 
     OUTPUT FORMAT:
     Respond with ONE JSON object and nothing else. Do NOT write markdown fences.
     Do NOT write type declarations. Do NOT explain.
     Every key and every string value MUST be wrapped in double quotes.
 
-    That one object wraps an ARRAY. Put EVERY distinct case cited in the text
-    into the "citedCases" array — it may hold one, many, or zero entries.
-    Never stop after the first case.
-
-    Return exactly this shape (this example shows two cases; emit as many as the text cites):
-    {"citedCases":[{"caseName":"Excel Wear v. Union of India","citation":"(1978) 4 SCC 224","year":1978,"court":"Supreme Court of India","context":"Cited on the scope of Article 19(1)(g).","pageNumber":5},{"caseName":"S.R. Bommai v. Union of India","citation":"(1994) 3 SCC 1","year":1994,"court":"Supreme Court of India","context":"Cited on secularism as basic structure.","pageNumber":6}]}
-
-    9. Extract a case whenever its name appears in adversarial form, WHATEVER the
-       reason it is mentioned. Do not limit yourself to cases relied on as authority.
-       Also extract cases that are:
-       - distinguished, doubted, overruled or disapproved;
-       - named as the real case behind a disputed or mis-recorded citation. When the
-         text says "the judgment given at citation X is namely A v. B", extract
-         "A v. B" with citation X;
-       - reported as not found, unverifiable or non-existent. Still extract them, and
-         say so in the context field (e.g. "Court found this case non-existent on
-         physical verification").
-       A court checking whether citations are genuine is exactly when these cases
-       matter most, so never skip one because it is not being followed as precedent.
+    Return exactly this shape:
+    {"citedCases":[{"caseName":"Kesavananda Bharati v. State of Kerala","citation":"(1973) 4 SCC 225","year":1973,"court":"Supreme Court of India","context":"Observed secularism is a basic feature of the Constitution.","pageNumber":4},{"caseName":"S.R. Bommai v. Union of India","citation":"(1994) 3 SCC 1","year":1994,"court":"Supreme Court of India","context":"Cited on secularism as basic structure.","pageNumber":4}]}
 
     Field rules:
-    - "caseName": string, required
-    - "citation": string or null
+    - "caseName": string, required (without trailing footnote numbers)
+    - "citation": string or null (never a bare digit like 1 or 2; must be a real reporter citation or null)
     - "year": number or null
     - "court": string or null
     - "context": string or null
@@ -1081,7 +998,7 @@ class LLMManager: ObservableObject {
     let passageExcerptNote = """
 
     INPUT FORMAT NOTE:
-    The text below consists of candidate excerpts surrounding cited cases. Each excerpt is prefixed with [Page N excerpt] indicating the PDF page number. Passages from different regions are separated by "[…]". Extract the cases cited directly from these excerpts and set the pageNumber field to the page indicated.
+    The text below consists of candidate excerpts surrounding cited cases. Each excerpt is prefixed with [Page N excerpt] indicating the PDF page number. Footnotes appear at the bottom under "FOOTNOTES FOR THIS PAGE:". Map any footnote numbers in case names to their actual legal citations listed in the footnotes block.
     """
 
     let strictThinkingDirective = """
@@ -1089,7 +1006,7 @@ class LLMManager: ObservableObject {
     REASONING GUIDELINE (Inside <|channel>thought):
     - Write your thoughts as a natural, conversational stream-of-consciousness (thinking out loud).
     - Avoid robotic templates, repeating lines, "1. Analyze", "Step 1", or structured tables.
-    - Start directly with conversational phrases like: "Let's look at paragraph...", "Scanning this chunk...", "I see footnote 1 maps to..."
+    - Start directly with conversational phrases like: "Scanning this chunk...", "Footnote 2 maps to (1994) 3 SCC 1..."
     - Keep thoughts fluid, conversational, and under 50 words total. Do not write "Thinking Process:" or "Thinking:" as the UI displays it.
     """
     
@@ -1107,7 +1024,6 @@ class LLMManager: ObservableObject {
         let progressClosure: @Sendable (Progress) -> Void = { progress in
             Task { @MainActor in
                 self.downloadProgress = progress.fractionCompleted
-                
                 let completedMB = Double(progress.completedUnitCount) / (1024 * 1024)
                 let totalMB = Double(progress.totalUnitCount) / (1024 * 1024)
                 let pct = Int(progress.fractionCompleted * 100)
@@ -1196,7 +1112,6 @@ class LLMManager: ObservableObject {
 
         let container = try await loadContainer(repoID: repoID, architectureType: model.architectureType)
         let basePrompt = jsonSystemPrompt
-
         let promptWithThinking = thinkingEnabled ? (basePrompt + strictThinkingDirective) : basePrompt
 
         let totalStartTime = CFAbsoluteTimeGetCurrent()
@@ -1205,12 +1120,9 @@ class LLMManager: ObservableObject {
         let batches = Self.chunkByPages(cleanedText)
         let isSingleBatch = batches.count == 1
 
-        // Kept in real page order (blanks included) so index + 1 is the true PDF
-        // page number when page attributions are resolved against the text later.
         let pageTexts = cleanedText.components(separatedBy: PDFParser.pageBreakMarker)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
 
-        // Self-reference extraction from first batch
         statusText = "Identifying document's own case..."
         let selfRef = try await extractSelfReference(
             container: container,
@@ -1218,7 +1130,6 @@ class LLMManager: ObservableObject {
             thinkingEnabled: thinkingEnabled
         )
 
-        // Build dynamic exclusion clause
         var exclusionClause = ""
         if let title = selfRef.caseTitle {
             exclusionClause += "\n\n    SELF-REFERENCE EXCLUSION: This document's own case is \"\(title)\""
@@ -1258,7 +1169,6 @@ class LLMManager: ObservableObject {
                 }
                 textToSend = CitationScanner.formatAnnotatedPassages(passages)
             } else {
-                // Replace internal page markers with human-readable labels
                 let markerPattern = "<<<PAGE_(\\d+)>>>\\n?"
                 if let regex = try? NSRegularExpression(pattern: markerPattern) {
                     textToSend = regex.stringByReplacingMatches(
@@ -1316,16 +1226,21 @@ class LLMManager: ObservableObject {
             mergedResult = Self.mergeChunkOutputs(chunkOutputs)
         }
 
-        // Remove the model's own attempts at the self-reference, then surface it
-        // once at the top as an explicitly marked row. Showing it beats hiding it:
-        // the reader can confirm the document was identified correctly, and sees
-        // why that case is absent from the cited list.
         if let parsed = DocumentExtractionResult.parse(from: mergedResult) {
             var finalCases = Self.filterSelfReferences(parsed.citedCases, selfRef: selfRef)
             if finalCases.count < parsed.citedCases.count {
                 print("🧹 [SELF-REF FILTER] Removed \(parsed.citedCases.count - finalCases.count) duplicate self-reference(s) from the cited list")
             }
+            
+            // 1. Resolve Correct Page Numbers
             finalCases = Self.resolvePageNumbers(finalCases, pageTexts: pageTexts)
+            
+            // 2. Resolve Footnotes
+            finalCases = Self.resolveFootnoteCitations(finalCases, pageTexts: pageTexts)
+            
+            // 3. Resolve Exact Citations & Case Names from PDF for Highlighting
+            finalCases = Self.resolveExactPDFCitation(finalCases, pageTexts: pageTexts)
+            
             if let selfRow = Self.makeSelfReferenceRow(selfRef) {
                 finalCases.insert(selfRow, at: 0)
             }
@@ -1399,16 +1314,6 @@ class LLMManager: ObservableObject {
         return selfRef
     }
 
-    /// Pulls the individual case identifiers out of a possibly compound reference.
-    ///
-    /// A document's own number is regularly a compound of several matters —
-    /// "W.P.(C) 16754/2025 & CM APPL. 68768/2025" — so comparing the whole string
-    /// never matches a document that cites just one half of it. Reducing both sides
-    /// to a set of canonical identifiers makes the comparison work either way.
-    ///
-    /// Recognises the two forms used across Indian courts: a docket number/year
-    /// ("16754/2025", "645 of 2020") and a neutral citation ("2025:DHC:10505",
-    /// "2024 INSC 893"). No court, format or document is hard-coded.
     private static func caseNumberKeys(_ raw: String?) -> Set<String> {
         guard let raw, !raw.isEmpty else { return [] }
         let ns = raw as NSString
@@ -1433,12 +1338,7 @@ class LLMManager: ObservableObject {
         return keys
     }
 
-    /// Builds the row representing the document's own case. Returns nil when the
-    /// self-reference could not be identified, in which case the table simply has
-    /// no such row rather than a misleading placeholder.
     private static func makeSelfReferenceRow(_ selfRef: DocumentSelfReference) -> CitedCase? {
-        // Prefer the title as the name; fall back to the number so a document whose
-        // title could not be read is still represented.
         guard let name = selfRef.caseTitle ?? selfRef.caseNumber else { return nil }
         let citation = (selfRef.caseTitle != nil) ? selfRef.caseNumber : nil
 
@@ -1457,13 +1357,9 @@ class LLMManager: ObservableObject {
         let selfTokens = selfRef.caseTitle.map(nameTokens) ?? []
         let selfNumberKeys = caseNumberKeys(selfRef.caseNumber)
 
-        // Either signal alone is enough; a title that reduces to nothing but noise
-        // words should not disable number matching as well.
         guard !selfTokens.isEmpty || !selfNumberKeys.isEmpty else { return cases }
 
         return cases.filter { c in
-            // Identifier match. Check the name too, because a self-reference is often
-            // emitted under its docket number rather than its party names.
             if !selfNumberKeys.isEmpty {
                 let candidateKeys = caseNumberKeys(c.citation).union(caseNumberKeys(c.caseName))
                 if !candidateKeys.isDisjoint(with: selfNumberKeys) { return false }
@@ -1477,10 +1373,6 @@ class LLMManager: ObservableObject {
             let jaccard = Double(intersection.count) / Double(selfTokens.union(caseTokens).count)
             if jaccard > 0.7 { return false }
 
-            // Documents often cite themselves in shortened form, which scores low on
-            // Jaccard. Treat it as a self-reference when every distinctive token of the
-            // shorter name appears in the other. Require >= 2 tokens so a single shared
-            // surname (e.g. "Singh v. State of Punjab") is not wrongly dropped.
             let minCount = min(selfTokens.count, caseTokens.count)
             if minCount >= 2 && intersection.count == minCount { return false }
 
@@ -1536,37 +1428,13 @@ class LLMManager: ObservableObject {
         Parse failures: \(parseFailures.isEmpty ? "none" : "⚠️ \(parseFailures.count) batch(es)")
         ══════════════════════════════════════════════
         """)
-
-        for m in truncated {
-            print("⚠️  TRUNCATED: batch \(m.label) was cut off by maxTokens after \(m.generatedTokens) generated tokens (~\(m.estimatedThinkingTokens) of them thinking) — citations near the end of this batch were probably lost.")
-        }
-        for m in parseFailures {
-            print("⚠️  PARSE FAILED: batch \(m.label) contributed 0 cases to the merged result.")
-        }
     }
 
     static let internalPageMarker = "<<<PAGE_"
     static let internalPageMarkerSuffix = ">>>"
 
-    /// Removes running headers and footers — the page furniture that repeats on
-    /// nearly every page.
-    ///
-    /// This matters beyond tidiness: a court document's furniture almost always
-    /// carries its OWN docket number ("W.P.(C) 16754/2025  Page 4 of 39"). The
-    /// citation scanner sees a docket-shaped string on every single page, so no
-    /// page can ever be skipped, and each one hands the model the document's own
-    /// identity as if it were a cited precedent. Stripping the furniture removes
-    /// that pressure at the source instead of relying on the self-reference
-    /// filter to clean it up afterwards.
-    ///
-    /// Detection is structural rather than pattern-based: digit runs are collapsed
-    /// so "Page 4 of 39" and "Page 5 of 39" count as the same line, and any line
-    /// present on most pages is treated as furniture. Nothing about a particular
-    /// court, format or document is hard-coded.
     static func stripRunningHeaders(_ text: String) -> String {
         let pages = text.components(separatedBy: PDFParser.pageBreakMarker)
-
-        // Too few pages to tell furniture apart from content that merely recurs.
         guard pages.count >= 4 else { return text }
 
         func normalized(_ line: String) -> String {
@@ -1585,8 +1453,6 @@ class LLMManager: ObservableObject {
             return out
         }
 
-        // Count the number of PAGES a normalized line appears on, not total
-        // occurrences, so a line repeated many times on one page cannot qualify.
         var pageCount: [String: Int] = [:]
         for page in pages {
             var seen = Set<String>()
@@ -1597,8 +1463,6 @@ class LLMManager: ObservableObject {
             for key in seen { pageCount[key, default: 0] += 1 }
         }
 
-        // 60% is deliberately conservative: genuine body text does not recur on
-        // three fifths of a judgment's pages, while furniture appears on all of them.
         let threshold = Int((Double(pages.count) * 0.6).rounded())
         let furniture = Set(pageCount.filter { $0.value >= threshold }.keys)
         guard !furniture.isEmpty else { return text }
@@ -1614,9 +1478,6 @@ class LLMManager: ObservableObject {
     }
 
     private static func chunkByPages(_ text: String, pagesPerBatch: Int = 2) -> [PageBatch] {
-        // Blank pages are KEPT. Page numbers come from this array's indices, so
-        // dropping a blank page would shift every later page number down by one and
-        // send the viewer to the wrong page.
         let pages = text.components(separatedBy: PDFParser.pageBreakMarker)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
 
@@ -1630,7 +1491,6 @@ class LLMManager: ObservableObject {
 
         while index < pages.count {
             let end = min(index + pagesPerBatch, pages.count)
-            // Skip blank pages when building the text, but keep their numbering.
             let batchText = (index..<end)
                 .filter { !pages[$0].isEmpty }
                 .map { offset in
@@ -1650,18 +1510,8 @@ class LLMManager: ObservableObject {
         return batches
     }
 
-    /// Replaces the model's page guess with the page the case actually appears on.
-    ///
-    /// The model's number was unreliable by construction: an excerpt window opens
-    /// ~350 characters before its match, so a case at the top of page 6 sits in a
-    /// window that begins on page 5 and gets labelled accordingly. Page numbers
-    /// drive both the table and the PDF viewer's scroll, so they have to be exact.
-    ///
-    /// Matching uses the distinctive name tokens rather than the literal string, so
-    /// a case the model wrote as "... v. Union of India" still matches the document's
-    /// "... v. UOI". Where a case appears on several pages, the occurrence NEAREST
-    /// the model's estimate wins, so repeated citations each keep their own page
-    /// instead of all collapsing onto the first.
+    // MARK: - Page & Citation Resolvers
+
     private static func resolvePageNumbers(_ cases: [CitedCase], pageTexts: [String]) -> [CitedCase] {
         guard !pageTexts.isEmpty else { return cases }
         let lowered = pageTexts.map { $0.lowercased() }
@@ -1695,13 +1545,236 @@ class LLMManager: ObservableObject {
         }
     }
 
-    /// Drops placeholder rows only. Repeated cases are deliberately KEPT.
-    ///
-    /// Deduplication used to collapse rows sharing a name and citation, but a case
-    /// cited several times is cited for different propositions on different pages,
-    /// and each occurrence is a real result with its own context and page number.
-    /// Collapsing them also hid conflicting citations for the same case name —
-    /// exactly the signal that matters when checking authorities.
+    /// Match citation and party names against PDF text to get exact verbatim string for highlighting
+    /// Match citation against PDF text to get exact verbatim string for highlighting.
+    /// Citation-name pollution avoid karne ke liye sirf citation tokens match kiye jaate hain — case name kabhi involve nahi hoti.
+    private static func resolveExactPDFCitation(_ cases: [CitedCase], pageTexts: [String]) -> [CitedCase] {
+        guard !pageTexts.isEmpty else { return cases }
+
+        return cases.map { c in
+            guard !c.isSelfReference,
+                  let citation = c.citation?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !citation.isEmpty else {
+                return c
+            }
+
+            let citationTokens = citation
+                .components(separatedBy: CharacterSet.alphanumerics.inverted)
+                .filter { !$0.isEmpty }
+            guard citationTokens.count >= 2 else { return c }
+
+            let gap = "[\\s\\(\\)\\[\\]\\.,\\-–/]+"
+
+            // 🔹 Build EXACT pattern (as before)
+            let exactPattern = citationTokens
+                .map { NSRegularExpression.escapedPattern(for: $0) }
+                .joined(separator: gap)
+                + "[\\)\\]\\.]{0,3}"
+
+            // 🔹 Build FUZZY pattern: numeric tokens stay exact, alphabetic "reporter" tokens
+            //    (short, all-letters, e.g. SCC/ELT/ITR/SSC) become a loose wildcard
+            //    so OCR/typo mismatches like SSC vs SCC still match, since numbers anchor specificity.
+            let fuzzyTokens = citationTokens.map { token -> String in
+                let isNumeric = token.allSatisfy { $0.isNumber }
+                let isShortAlpha = !isNumeric && token.count <= 6 && token.allSatisfy { $0.isLetter }
+                if isShortAlpha {
+                    return "[A-Za-z]{2,6}"   // reporter-code wildcard
+                }
+                return NSRegularExpression.escapedPattern(for: token)
+            }
+            let hasNumericAnchor = citationTokens.contains { $0.allSatisfy { $0.isNumber } }
+            let fuzzyPattern = fuzzyTokens.joined(separator: gap) + "[\\)\\]\\.]{0,3}"
+
+            guard let exactRegex = try? NSRegularExpression(pattern: exactPattern, options: [.caseInsensitive]) else {
+                return c
+            }
+            // Only build fuzzy regex if there's at least one numeric anchor (avoid over-matching)
+            let fuzzyRegex = hasNumericAnchor
+                ? try? NSRegularExpression(pattern: fuzzyPattern, options: [.caseInsensitive])
+                : nil
+
+            let targetPage = (c.pageNumber ?? 1) - 1
+            var searchPages: [Int] = []
+            if targetPage >= 0 && targetPage < pageTexts.count { searchPages.append(targetPage) }
+            if targetPage - 1 >= 0 { searchPages.append(targetPage - 1) }
+            if targetPage + 1 < pageTexts.count { searchPages.append(targetPage + 1) }
+
+            func clean(_ raw: String) -> String {
+                var s = raw
+                    .components(separatedBy: .whitespacesAndNewlines)
+                    .filter { !$0.isEmpty }
+                    .joined(separator: " ")
+                if s.hasPrefix("[") && s.hasSuffix("]") {
+                    s = String(s.dropFirst().dropLast()).trimmingCharacters(in: .whitespaces)
+                }
+                return s
+            }
+
+            // 1️⃣ Try EXACT match first
+            for p in searchPages {
+                let text = pageTexts[p]
+                let ns = text as NSString
+                if let match = exactRegex.firstMatch(in: text, range: NSRange(location: 0, length: ns.length)) {
+                    let rawMatchedText = ns.substring(with: match.range)
+                    let displayText = clean(rawMatchedText)
+                    print("🎯 [CITATION EXACT MATCH] Page \(p + 1): '\(citation)' -> '\(displayText)'")
+                    return CitedCase(
+                        caseName: c.caseName, citation: displayText, year: c.year, court: c.court,
+                        context: c.context, pageNumber: p + 1, isSelfReference: c.isSelfReference,
+                        pdfHighlightText: rawMatchedText
+                    )
+                }
+            }
+
+            // 2️⃣ Try FUZZY match (tolerates reporter-code OCR/typo mismatches)
+            if let fuzzyRegex {
+                for p in searchPages {
+                    let text = pageTexts[p]
+                    let ns = text as NSString
+                    if let match = fuzzyRegex.firstMatch(in: text, range: NSRange(location: 0, length: ns.length)) {
+                        let rawMatchedText = ns.substring(with: match.range)
+                        let displayText = clean(rawMatchedText)
+                        print("🎯 [CITATION FUZZY MATCH] Page \(p + 1): '\(citation)' -> '\(displayText)'")
+                        return CitedCase(
+                            caseName: c.caseName, citation: displayText, year: c.year, court: c.court,
+                            context: c.context, pageNumber: p + 1, isSelfReference: c.isSelfReference,
+                            pdfHighlightText: rawMatchedText
+                        )
+                    }
+                }
+            }
+
+            // 3️⃣ Final fallback
+            let fallbackClean = clean(citation)
+            print("⚠️ [NO PDF MATCH] '\(citation)' not found on pages \(searchPages.map { $0 + 1 })")
+            return CitedCase(
+                caseName: c.caseName, citation: fallbackClean, year: c.year, court: c.court,
+                context: c.context, pageNumber: c.pageNumber, isSelfReference: c.isSelfReference,
+                pdfHighlightText: fallbackClean
+            )
+        }
+    }
+             
+    private static func extractFootnotes(from pageTexts: [String]) -> [Int: [String: String]] {
+        var pageFootnotes: [Int: [String: String]] = [:]
+
+        let pattern = "(?m)^\\s*(\\d{1,2})[\\.\\s\\t]+([\\(\\[]?(?:19|20)\\d{2}.*?(?:SCC|AIR|SCR|ITR|ELT|SCALE|JT|INSC|Supp|Online|OnLine).*)$"
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
+            return pageFootnotes
+        }
+
+        for (idx, pageText) in pageTexts.enumerated() {
+            let pageNum = idx + 1
+            var footnotes: [String: String] = [:]
+            let ns = pageText as NSString
+            let matches = regex.matches(in: pageText, range: NSRange(location: 0, length: ns.length))
+
+            for m in matches where m.numberOfRanges >= 3 {
+                let numStr = ns.substring(with: m.range(at: 1)).trimmingCharacters(in: .whitespacesAndNewlines)
+                let citationStr = ns.substring(with: m.range(at: 2)).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !numStr.isEmpty && !citationStr.isEmpty {
+                    footnotes[numStr] = citationStr
+                }
+            }
+
+            if footnotes.isEmpty {
+                let fallbackPattern = "(?m)^\\s*(\\d{1,2})[\\.\\s\\t]+((?:(?:\\(?\\d{4}\\)?)|(?:AIR|SCC|SCR|ITR|ELT|SCALE|JT|INSC)).{5,100})$"
+                if let fallbackRegex = try? NSRegularExpression(pattern: fallbackPattern, options: [.caseInsensitive]) {
+                    let fallbackMatches = fallbackRegex.matches(in: pageText, range: NSRange(location: 0, length: ns.length))
+                    for m in fallbackMatches where m.numberOfRanges >= 3 {
+                        let numStr = ns.substring(with: m.range(at: 1)).trimmingCharacters(in: .whitespacesAndNewlines)
+                        let citationStr = ns.substring(with: m.range(at: 2)).trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !numStr.isEmpty && !citationStr.isEmpty {
+                            footnotes[numStr] = citationStr
+                        }
+                    }
+                }
+            }
+
+            if !footnotes.isEmpty {
+                pageFootnotes[pageNum] = footnotes
+            }
+        }
+        return pageFootnotes
+    }
+
+    private static func resolveFootnoteCitations(_ cases: [CitedCase], pageTexts: [String]) -> [CitedCase] {
+        guard !cases.isEmpty, !pageTexts.isEmpty else { return cases }
+        let footnotesByPage = extractFootnotes(from: pageTexts)
+
+        var allFootnotes: [String: String] = [:]
+        for (_, map) in footnotesByPage {
+            for (k, v) in map {
+                allFootnotes[k] = v
+            }
+        }
+
+        return cases.map { c in
+            guard !c.isSelfReference else { return c }
+
+            var footnoteKey: String? = nil
+            if let citation = c.citation?.trimmingCharacters(in: .whitespacesAndNewlines) {
+                let cleaned = citation.trimmingCharacters(in: CharacterSet(charactersIn: "()[]{}."))
+                if let num = Int(cleaned), num > 0 && num < 100 {
+                    footnoteKey = String(num)
+                }
+            }
+
+            var cleanCaseName = c.caseName
+            if footnoteKey == nil {
+                let trailingDigitRegex = try? NSRegularExpression(pattern: "\\s+(\\d{1,2})$")
+                let nsName = c.caseName as NSString
+                if let match = trailingDigitRegex?.firstMatch(in: c.caseName, range: NSRange(location: 0, length: nsName.length)),
+                   match.numberOfRanges >= 2 {
+                    let digitStr = nsName.substring(with: match.range(at: 1))
+                    footnoteKey = digitStr
+                    cleanCaseName = nsName.substring(with: NSRange(location: 0, length: match.range.location)).trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+            }
+
+            guard let key = footnoteKey else { return c }
+
+            let page = c.pageNumber ?? 1
+            let resolvedCitation = footnotesByPage[page]?[key]
+                ?? footnotesByPage[page - 1]?[key]
+                ?? footnotesByPage[page + 1]?[key]
+                ?? allFootnotes[key]
+
+            guard let finalCitation = resolvedCitation else {
+                return CitedCase(
+                    caseName: cleanCaseName,
+                    citation: c.citation,
+                    year: c.year,
+                    court: c.court,
+                    context: c.context,
+                    pageNumber: c.pageNumber,
+                    isSelfReference: c.isSelfReference
+                )
+            }
+
+            var finalYear = c.year
+            if finalYear == nil || (finalYear ?? 0) < 1800 {
+                let yearRegex = try? NSRegularExpression(pattern: "\\b(19\\d{2}|20\\d{2})\\b")
+                let nsCit = finalCitation as NSString
+                if let match = yearRegex?.firstMatch(in: finalCitation, range: NSRange(location: 0, length: nsCit.length)) {
+                    finalYear = Int(nsCit.substring(with: match.range))
+                }
+            }
+
+            print("📚 [FOOTNOTE RESOLVED] \(cleanCaseName): '\(c.citation ?? "nil")' -> '\(finalCitation)' (Year: \(finalYear.map(String.init) ?? "nil"))")
+
+            return CitedCase(
+                caseName: cleanCaseName,
+                citation: finalCitation,
+                year: finalYear,
+                court: c.court ?? "Supreme Court of India",
+                context: c.context,
+                pageNumber: c.pageNumber,
+                isSelfReference: c.isSelfReference
+            )
+        }
+    }
+
     private static func removingPlaceholders(_ cases: [CitedCase]) -> [CitedCase] {
         cases.filter { c in
             let cleanName = c.caseName.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1715,8 +1788,6 @@ class LLMManager: ObservableObject {
         let noise: Set<String> = ["versus", "state", "union", "india", "ltd", "limited",
                                   "anr", "another", "ors", "others", "the", "and", "bank",
                                   "company", "corporation", "pvt", "private",
-                                  // Procedural / party-role words carry no identity and
-                                  // otherwise dilute similarity against shortened forms.
                                   "petitioner", "petitioners", "respondent", "respondents",
                                   "appellant", "appellants", "applicant", "applicants",
                                   "plaintiff", "plaintiffs", "defendant", "defendants",
@@ -1777,16 +1848,12 @@ class LLMManager: ObservableObject {
                 Chat.Message(role: .system, content: activePrompt),
                 Chat.Message(role: .user, content: userContent)
             ]
-            print("Chat Message: START\n")
-            print("chats: \(chatMessages)")
-            print("Chat Message END \n")
+            
             let input = try await context.processor.prepare(
                 input: UserInput(
                     prompt: .chat(chatMessages),
                     additionalContext: [
-                        "enable_thinking": thinkingEnabled,
-                        //"thinking_budget": 192,
-                      //    "max_thinking_tokens": 192
+                        "enable_thinking": thinkingEnabled
                     ]
                 )
             )
@@ -1794,24 +1861,9 @@ class LLMManager: ObservableObject {
             var generateParameters = GenerateParameters(temperature: 0.0)
             generateParameters.maxTokens = 2048
 
-            // Penalties are deliberately left nil (off).
-            //
-            // Valid JSON REQUIRES heavy token repetition: "caseName", "citation",
-            // "year", "court", "context", "pageNumber" plus { } " , : recur for every
-            // element of citedCases. Any repetition/presence/frequency penalty makes
-            // those structural tokens progressively less likely as the array grows,
-            // so the model drifts toward an early EOS and the array truncates after a
-            // few entries. Do not enable them to "reduce repetition" here.
-            //
-            // Note repetitionPenalty = 1.0 is NOT the same as off: GenerateParameters
-            // builds a PenaltyProcessor for any non-zero value, so 1.0 runs the
-            // processor on every token to perform a mathematical no-op.
             generateParameters.repetitionPenalty = nil
             generateParameters.presencePenalty = nil
             generateParameters.frequencyPenalty = nil
-
-            // topP is intentionally unset: temperature 0 selects ArgMaxSampler, which
-            // bypasses top-p/top-k/min-p entirely, so setting it would be dead config.
 
             let stream = try MLXLMCommon.generate(
                 input: input,
